@@ -97,6 +97,69 @@ def test_compute_baseline_d_must_be_divisible_by_8():
         )
 
 
+def test_compute_baseline_centering_default_on():
+    """The default behaviour must be ``center=True``. The blog-post number
+    depends on this — flipping the default silently would regress remax's
+    most important reproducibility claim."""
+    rng = np.random.default_rng(0)
+    # Synthetic data with a heavy mean offset on one dimension — the same
+    # pattern SPECTER2 exhibits (one dim with mean ≈ 15.5).
+    emb = rng.standard_normal((400, 64)).astype(np.float32)
+    emb[:, 0] += 15.0
+    n_q = 30
+
+    centered_default = compute_baseline_for_embeddings(
+        name="off", emb=emb, n_queries=n_q, k_eval=10, seed=42,
+    )
+    centered_explicit = compute_baseline_for_embeddings(
+        name="off", emb=emb, n_queries=n_q, k_eval=10, seed=42, center=True,
+    )
+    uncentered = compute_baseline_for_embeddings(
+        name="off", emb=emb, n_queries=n_q, k_eval=10, seed=42, center=False,
+    )
+
+    assert centered_default["1-bit"] == pytest.approx(centered_explicit["1-bit"])
+    # Centering should help on data with a heavy mean offset. Strict
+    # inequality is the contract — a non-trivial offset must produce
+    # measurably different recall.
+    assert centered_default["1-bit"] > uncentered["1-bit"]
+
+
+def test_compute_baseline_centering_uses_corpus_mean_not_full_mean():
+    """Centering must use *corpus* mean, not the full embedding mean.
+    Using the full mean leaks query information into the encoder boundary,
+    which is the wrong protocol — Lloyd-Max would train on the corpus only.
+    """
+    rng = np.random.default_rng(0)
+    # Construct emb where queries (the first 30 rows after shuffling) have
+    # a different mean than the corpus.
+    emb = rng.standard_normal((400, 64)).astype(np.float32)
+    # Shift the query rows so that corpus_mean != full_mean by a non-trivial
+    # amount. The exact identity of which rows become queries depends on the
+    # internal split RNG (QUERY_SPLIT_SEED=99, so we can construct it).
+    from remax.bench.run_baseline import QUERY_SPLIT_SEED
+    perm = np.random.default_rng(QUERY_SPLIT_SEED).permutation(emb.shape[0])
+    query_rows = perm[:30]
+    emb[query_rows] += 5.0  # all-axis shift, forces full_mean ≠ corpus_mean
+
+    row = compute_baseline_for_embeddings(
+        name="x", emb=emb, n_queries=30, k_eval=10, seed=42, center=True,
+    )
+
+    # Hand-roll the centered-by-corpus-mean baseline and compare.
+    from remax import SignBitQuantizer
+    from remax.bench.eval import exact_knn, recall_at_k
+    queries = emb[query_rows]
+    corpus = emb[perm[30:]]
+    truth = exact_knn(corpus, queries, k=10)
+    mu_corpus = corpus.mean(axis=0)
+    q = SignBitQuantizer(d=64, seed=42)
+    pred = q.search(queries - mu_corpus, q.encode(corpus - mu_corpus), k=10)
+    expected = recall_at_k(pred, truth, k=10)
+
+    assert row["1-bit"] == pytest.approx(expected)
+
+
 # --------------------------------------------------------------------- #
 # format_baseline_md
 # --------------------------------------------------------------------- #
@@ -163,6 +226,24 @@ def test_format_baseline_md_includes_protocol_block():
     assert "seed" in md.lower() # protocol block
     assert "0.1.0" in md        # version
     assert "R@10" in md or "k=10" in md or "@10" in md  # eval metric
+
+
+def test_format_baseline_md_documents_centering():
+    """Centering is the load-bearing reproducibility detail; it must appear
+    in the protocol block for both center=True and center=False runs."""
+    md_on = format_baseline_md(
+        rows=_sample_rows(), version="0.1.0",
+        n_queries=100, k_eval=10, seed=42, center=True,
+    )
+    md_off = format_baseline_md(
+        rows=_sample_rows(), version="0.1.0",
+        n_queries=100, k_eval=10, seed=42, center=False,
+    )
+    assert "center" in md_on.lower()
+    assert "center" in md_off.lower()
+    # The two messages must differ — silent identical text would defeat the
+    # purpose of surfacing the flag.
+    assert md_on != md_off
 
 
 def test_format_baseline_md_starts_with_h2():

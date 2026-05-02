@@ -179,27 +179,44 @@ def format_baseline_md(
     n_queries: int,
     k_eval: int,
     seed: int,
+    center: bool = True,
 ) -> str:
     """Render rows into the BASELINE.md table mandated by issue #4.
 
     The first column is the dataset name; remaining columns are ``n``, ``d``,
     ``1-bit``, ``k=2``, ``k=4``, ``k=8`` — order frozen by the issue.
 
-    A protocol block at the top documents the query split, eval cutoff, and
-    seeds so the table is reproducible.
+    A protocol block at the top documents the query split, eval cutoff,
+    seeds, and centering so the table is reproducible.
     """
     lines: list[str] = []
     lines.append(f"## remax v{version} baseline — R@{k_eval} vs float32")
     lines.append("")
+    lines.append(f"- **Library version**: remax v{version}")
     lines.append(
-        f"- **Library version**: remax v{version}"
+        f"- **Eval metric**: R@{k_eval} vs float32 inner-product ground "
+        f"truth (computed on raw, un-centered vectors)."
     )
-    lines.append(f"- **Eval metric**: R@{k_eval} vs float32 inner-product ground truth")
     lines.append(
         f"- **Protocol**: {n_queries} held-out queries per dataset, "
         f"corpus = remainder. Query split seed = {QUERY_SPLIT_SEED}, "
         f"quantizer seed = {seed}."
     )
+    if center:
+        lines.append(
+            "- **Centering**: corpus and queries are centered by the "
+            "corpus mean before encoding. Pure SimHash assumes mean-zero "
+            "data; real embeddings (SPECTER2 has one dim with mean ≈ 15.5) "
+            "violate this. Lloyd-Max 1-bit boundaries are adaptive per "
+            "dimension, so they implicitly center; the SimHash-equivalent "
+            "is `sign(X - corpus.mean(0))`. Disable with `--no-center`."
+        )
+    else:
+        lines.append(
+            "- **Centering**: disabled (`--no-center`). Numbers are pure "
+            "SimHash on raw embeddings; expect collapse on un-centered "
+            "real data."
+        )
     lines.append(
         "- **Hardware**: pure NumPy on CPU. No SIMD/Numba/GPU paths "
         "(those are post-v0.1.0 by design — see CLAUDE.md anti-goals)."
