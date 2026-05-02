@@ -12,10 +12,10 @@ venv/
 .env
 
 # Bench artifacts
-bench/cache/
-bench/results/*.png
-bench/results/*.csv
+bench/.cache/
+bench/results/*
 !bench/results/.gitkeep
+!bench/results/BASELINE.md
 
 # IDE
 .vscode/
