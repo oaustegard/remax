@@ -1,0 +1,293 @@
+"""Tests for ``remax.core`` — the 1-bit ``SignBitQuantizer`` and the
+functional primitives it composes (``haar_rotation``, ``encode_signs``,
+``hamming_distances``, ``hamming_search``).
+
+Required by issue #2:
+
+  1. Rotation orthogonality: ``R @ R.T ≈ I`` to 1e-6.
+  2. Determinism: same seed → byte-identical codes.
+  3. Roundtrip on synthetic Gaussian: Spearman ρ between true cosine and
+     SimHash-derived cosine estimate > 0.95 at d=768, n=1000.
+  4. Self-recall ≥ 95% on isotropic Gaussian, k=1.
+  5. ``d % 8 != 0`` raises a clear error.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from scipy.stats import spearmanr
+
+from remax import (
+    SignBitQuantizer,
+    encode_signs,
+    haar_rotation,
+    hamming_distances,
+    hamming_search,
+)
+
+
+# --------------------------------------------------------------------- #
+# 1. Rotation orthogonality
+# --------------------------------------------------------------------- #
+@pytest.mark.parametrize("d", [8, 64, 128, 768])
+def test_rotation_orthogonality(d: int):
+    R = haar_rotation(d=d, seed=0)
+    np.testing.assert_allclose(R @ R.T, np.eye(d), atol=1e-6)
+    np.testing.assert_allclose(R.T @ R, np.eye(d), atol=1e-6)
+
+
+def test_rotation_orthogonal_via_class():
+    q = SignBitQuantizer(d=128, seed=0)
+    np.testing.assert_allclose(q.rotation_ @ q.rotation_.T, np.eye(128), atol=1e-6)
+
+
+# --------------------------------------------------------------------- #
+# 2. Determinism
+# --------------------------------------------------------------------- #
+def test_seed_determinism_rotation():
+    R1 = haar_rotation(d=64, seed=123)
+    R2 = haar_rotation(d=64, seed=123)
+    np.testing.assert_array_equal(R1, R2)
+
+
+def test_seed_determinism_codes_byte_identical():
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((50, 256)).astype(np.float64)
+
+    q1 = SignBitQuantizer(d=256, seed=999)
+    q2 = SignBitQuantizer(d=256, seed=999)
+    c1 = q1.encode(X)
+    c2 = q2.encode(X)
+    assert c1.tobytes() == c2.tobytes()
+    np.testing.assert_array_equal(c1, c2)
+
+
+def test_different_seeds_produce_different_codes():
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((50, 256))
+    c1 = SignBitQuantizer(d=256, seed=1).encode(X)
+    c2 = SignBitQuantizer(d=256, seed=2).encode(X)
+    # Astronomically unlikely to collide on Gaussian data with two
+    # independent rotations; if this ever fires it's a real bug.
+    assert c1.tobytes() != c2.tobytes()
+
+
+# --------------------------------------------------------------------- #
+# 3. Spearman ρ between true cosine and SimHash-estimated cosine
+# --------------------------------------------------------------------- #
+def test_hamming_cosine_spearman_synthetic_gaussian():
+    """SimHash → cosine monotonicity on synthetic Gaussian-direction data.
+
+    Construct vectors with *known* cosine to a planted anchor:
+
+        X[i] = w[i] * anchor + sqrt(1 - w[i]^2) * v_perp[i]
+
+    where v_perp is a unit-norm Gaussian-direction sample orthogonalized
+    against the anchor, and w[i] ~ U(-1, 1). By construction
+    ``cos(X[i], anchor) == w[i]``, so we can measure Spearman ρ between
+    the *true* cosines (== w) and SimHash's estimate cos(π · h / n_bits)
+    without confounding from concentration of measure.
+
+    Pure isotropic Gaussian wouldn't work for this bar: at d=768 it
+    concentrates cosines around 0 with stdev ≈ 1/√d ≈ 0.036, well below
+    the SimHash noise floor — so ρ caps near 0.6 regardless of
+    implementation. Planted-cosine construction restores the dynamic
+    range the test is implicitly assuming.
+    """
+    rng = np.random.default_rng(7)
+    n, d = 1000, 768
+
+    anchor = rng.standard_normal(d)
+    anchor /= np.linalg.norm(anchor)
+
+    # Gaussian directions, orthogonalized against the anchor and
+    # unit-normalized. (This is what "Gaussian-direction noise" means.)
+    v = rng.standard_normal((n, d))
+    v -= (v @ anchor)[:, None] * anchor[None, :]
+    v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
+
+    w = rng.uniform(-1.0, 1.0, size=n)
+    X = (
+        w[:, None] * anchor[None, :]
+        + np.sqrt(1.0 - w**2)[:, None] * v
+    ).astype(np.float64)
+
+    q = SignBitQuantizer(d=d, seed=7)
+    codes = q.encode(X)
+
+    qcode = encode_signs(anchor @ q.rotation_)
+    h = hamming_distances(codes, qcode)
+    cos_est = np.cos(np.pi * h / q.n_bits)
+
+    rho, _ = spearmanr(w, cos_est)
+    assert rho > 0.95, f"Spearman ρ={rho:.4f}, expected > 0.95"
+
+
+# --------------------------------------------------------------------- #
+# 4. Self-recall on isotropic Gaussian
+# --------------------------------------------------------------------- #
+def test_self_recall_synthetic_gaussian():
+    rng = np.random.default_rng(11)
+    n, d = 500, 768
+    X = rng.standard_normal((n, d)).astype(np.float64)
+    q = SignBitQuantizer(d=d, seed=11)
+    codes = q.encode(X)
+
+    hits = 0
+    for i in range(n):
+        idx = q.search(X[i], codes, k=1)
+        if idx[0] == i:
+            hits += 1
+    recall = hits / n
+    # The query is byte-identical to codes[i] (rotation is the same), so
+    # its Hamming distance to itself is exactly zero. Tied zeros are not
+    # expected on Gaussian d=768 (collision probability ≈ 2^-768).
+    assert recall >= 0.95, f"self-recall@1 = {recall:.3f}, expected ≥ 0.95"
+
+
+# --------------------------------------------------------------------- #
+# 5. Block-size constraint
+# --------------------------------------------------------------------- #
+def test_d_not_multiple_of_8_raises_clear_error():
+    with pytest.raises(ValueError, match="divisible by 8"):
+        SignBitQuantizer(d=100, seed=0)
+
+
+def test_encode_signs_rejects_non_byte_aligned_input():
+    X = np.ones((4, 7))
+    with pytest.raises(ValueError, match="divisible by 8"):
+        encode_signs(X)
+
+
+def test_d_must_be_positive_integer():
+    with pytest.raises(ValueError, match="positive integer"):
+        SignBitQuantizer(d=0, seed=0)
+    with pytest.raises(ValueError, match="positive integer"):
+        SignBitQuantizer(d=-8, seed=0)
+
+
+# --------------------------------------------------------------------- #
+# Functional / class parity & shape sanity
+# --------------------------------------------------------------------- #
+def test_functional_class_parity():
+    """Class API is just sugar over the functional primitives."""
+    rng = np.random.default_rng(3)
+    n, d = 64, 128
+    X = rng.standard_normal((n, d))
+
+    R = haar_rotation(d, seed=3)
+    codes_func = encode_signs(X @ R)
+
+    q = SignBitQuantizer(d=d, seed=3)
+    codes_class = q.encode(X)
+
+    np.testing.assert_array_equal(codes_func, codes_class)
+
+
+def test_search_returns_self_first_with_zero_distance():
+    rng = np.random.default_rng(5)
+    n, d = 200, 256
+    X = rng.standard_normal((n, d))
+    q = SignBitQuantizer(d=d, seed=5)
+    codes = q.encode(X)
+
+    idx, dist = q.search(X[42], codes, k=10, return_distances=True)
+    assert idx.shape == (10,)
+    assert dist.shape == (10,)
+    assert idx[0] == 42
+    assert dist[0] == 0
+    # Distances must be non-decreasing.
+    assert np.all(np.diff(dist) >= 0)
+
+
+def test_batched_search_shape_and_self_first():
+    rng = np.random.default_rng(8)
+    n, d = 100, 64
+    X = rng.standard_normal((n, d))
+    q = SignBitQuantizer(d=d, seed=8)
+    codes = q.encode(X)
+
+    queries = X[[0, 50, 99]]
+    idx = q.search(queries, codes, k=3)
+    assert idx.shape == (3, 3)
+    assert idx[0, 0] == 0
+    assert idx[1, 0] == 50
+    assert idx[2, 0] == 99
+
+
+def test_encode_accepts_single_vector():
+    rng = np.random.default_rng(2)
+    d = 32
+    x = rng.standard_normal(d)
+    q = SignBitQuantizer(d=d, seed=2)
+    code = q.encode(x)
+    assert code.shape == (d // 8,)
+    assert code.dtype == np.uint8
+
+
+def test_hamming_search_functional_api():
+    """The standalone functional ``hamming_search`` matches the class API."""
+    rng = np.random.default_rng(9)
+    n, d = 80, 128
+    X = rng.standard_normal((n, d))
+    R = haar_rotation(d, seed=9)
+    codes = encode_signs(X @ R)
+
+    qvec = X[7]
+    idx_func = hamming_search(qvec @ R, codes, k=5)
+
+    q = SignBitQuantizer(d=d, seed=9)
+    np.testing.assert_array_equal(q.rotation_, R)  # same seed
+    idx_class = q.search(qvec, q.encode(X), k=5)
+
+    np.testing.assert_array_equal(idx_func, idx_class)
+
+
+def test_hamming_distances_symmetry():
+    """Hamming distance is symmetric and equals 0 for identical codes."""
+    rng = np.random.default_rng(13)
+    R = haar_rotation(64, seed=13)
+    X = rng.standard_normal((10, 64))
+    codes = encode_signs(X @ R)
+    # Each row should have distance 0 to itself.
+    for i in range(10):
+        d_self = hamming_distances(codes[i : i + 1], codes[i])
+        assert d_self[0] == 0
+    # Symmetry: d(a, b) == d(b, a).
+    d_ab = hamming_distances(codes[0:1], codes[1])[0]
+    d_ba = hamming_distances(codes[1:2], codes[0])[0]
+    assert d_ab == d_ba
+
+
+def test_search_validates_codes_shape():
+    rng = np.random.default_rng(0)
+    q = SignBitQuantizer(d=64, seed=0)
+    X = rng.standard_normal((10, 64))
+    codes = q.encode(X)
+    with pytest.raises(ValueError, match="incompatible"):
+        q.search(X[0], codes[:, :-1], k=3)  # truncated codes
+
+
+def test_k_larger_than_n_returns_all():
+    rng = np.random.default_rng(0)
+    q = SignBitQuantizer(d=32, seed=0)
+    X = rng.standard_normal((5, 32))
+    codes = q.encode(X)
+    idx = q.search(X[0], codes, k=100)
+    # ``min(k, n)`` semantics: clamp to n.
+    assert idx.shape == (5,)
+
+
+def test_fit_validates_shape():
+    q = SignBitQuantizer(d=16, seed=0)
+    rng = np.random.default_rng(0)
+    q.fit(rng.standard_normal((10, 16)))  # OK
+    with pytest.raises(ValueError, match="expected"):
+        q.fit(rng.standard_normal((10, 8)))
+
+
+def test_fit_returns_self():
+    q = SignBitQuantizer(d=16, seed=0)
+    assert q.fit() is q
+    assert q.fit(np.zeros((3, 16))) is q
