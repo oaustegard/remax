@@ -2,12 +2,11 @@
 
 Public surface (v0.1.0 in progress):
 
-* :class:`SignBitQuantizer` — 1-bit Charikar/SimHash core (this issue).
+* :class:`SignBitQuantizer` — 1-bit Charikar/SimHash core.
+* :class:`StackedSignBitQuantizer` — k-stack precision ladder
+  (variance ∝ 1/k, every step rank-correct).
 * Functional primitives: :func:`haar_rotation`, :func:`encode_signs`,
   :func:`hamming_distances`, :func:`hamming_search`.
-
-Multi-precision stacking (``StackedSignBitQuantizer``) is tracked in
-issue #3 and not yet exported.
 """
 
 from .core import (
@@ -17,11 +16,13 @@ from .core import (
     hamming_distances,
     hamming_search,
 )
+from .stacked import StackedSignBitQuantizer
 
 __version__ = "0.0.0"
 
 __all__ = [
     "SignBitQuantizer",
+    "StackedSignBitQuantizer",
     "haar_rotation",
     "encode_signs",
     "hamming_distances",
