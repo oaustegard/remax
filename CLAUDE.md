@@ -14,6 +14,19 @@ In May 2026 we discovered an empirical inversion on real SPECTER2 embeddings: 1-
 
 remax is the library that exploits this finding directly: skip the broken middle entirely, scale precision by stacking sign-bit signatures.
 
+## Differentiation from remex IVFCoarseIndex (added 2026-05-02)
+
+remex itself now ships a SimHash-flavored mechanism (`remex.IVFCoarseIndex`, PR [#58](https://github.com/oaustegard/remex/pull/58)). It is **not** the same use of the primitive. Internalize the difference before writing code:
+
+| | What it does | When it helps |
+|---|---|---|
+| **remex IVFCoarseIndex** | SimHash assigns cells; Lloyd-Max ADC scores within cells. SimHash is the *routing* layer. | Sublinear stage-1 at very large n (≥ 10M). The bottleneck it solves is bandwidth-bound flat scan. |
+| **remax StackedSignBitQuantizer** | Stacked SimHash *is* the score. No cells, no Lloyd-Max. | A rank-correct precision ladder where every step is monotone (no broken middle). |
+
+These compose orthogonally. A future architecture might use remex IVF for routing + remax stacked for in-cell scoring. v0.1.0 doesn't go there; mention it in docstrings, don't build it.
+
+remax's value claim is **the precision ladder, not sublinear search**. Don't reinvent IVFCoarseIndex inside remax. If the work an issue describes starts to look like cell assignment / multi-probe / nprobe, stop and reread the issue.
+
 ## Architecture (target)
 
 ```
