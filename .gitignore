@@ -21,6 +21,7 @@ bench/results/*
 !bench/results/CROSSOVER.md
 !bench/results/crossover.csv
 !bench/results/crossover.png
+!bench/results/RERANK.md
 
 # IDE
 .vscode/
