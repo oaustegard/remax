@@ -12,7 +12,7 @@ pip install remax transformers torch numpy
 
 ## 1. Load Pre-computed Embeddings
 
-Semantic Scholar publishes SPECTER2 embeddings for 200M+ papers as part
+Semantic Scholar publishes SPECTER2 embeddings for 100M+ papers as part
 of the [S2AG dataset releases](https://www.semanticscholar.org/product/api/tutorial).
 The `embeddings` dataset ships as gzipped JSON-lines files:
 
