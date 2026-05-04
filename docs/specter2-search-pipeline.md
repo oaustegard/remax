@@ -170,10 +170,10 @@ q = Quantizer(d=768, bits=4, seed=42)
 compressed = q.encode(candidate_vecs)
 final_idx, scores = q.search(compressed, query_vec, k=10)
 
-# Option B: cross-encoder rerank (highest quality, slowest)
+# Option B: cross-encoder rerank (slowest)
 from sentence_transformers import CrossEncoder
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2") #pick the best for your domain
 pairs = [(query_text, get_title_abstract(cid)) for cid in candidate_indices]
 scores = reranker.predict(pairs)
 top10 = np.argsort(-scores)[:10]
@@ -202,8 +202,8 @@ similarity (e.g., "find papers like this one"), use
 768-d vectors. A refreshed variant (`allenai/specter2_aug2023refresh_adhoc_query`)
 is also available with slightly newer training data.
 
-**Scaling.** At 200M vectors (the full S2 corpus), the index is
-~18.3 GB of packed codes. A brute-force Hamming scan is feasible on
+**Scaling.** At 100M vectors (the full S2 corpus), the index is
+~3.2 GB of packed codes. A brute-force Hamming scan is feasible on
 a single machine with NumPy. For sub-linear access, pair with
 remex's `IVFCoarseIndex` for cell routing (not yet integrated;
 tracked in the remax roadmap).
