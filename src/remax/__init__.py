@@ -17,6 +17,7 @@ from .core import (
     hamming_search,
 )
 from .stacked import StackedSignBitQuantizer
+from ._native import AVAILABLE as NATIVE_AVAILABLE
 
 __version__ = "0.0.0"
 
@@ -27,5 +28,6 @@ __all__ = [
     "encode_signs",
     "hamming_distances",
     "hamming_search",
+    "NATIVE_AVAILABLE",
     "__version__",
 ]
