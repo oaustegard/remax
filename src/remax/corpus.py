@@ -50,6 +50,7 @@ __all__ = ["Corpus", "Result"]
 
 _BIN_NAME = "index.bin"
 _DB_NAME = "meta.db"
+_MEAN_NAME = "mean.npy"
 
 # Format constants
 _MAGIC = b"RMAX"
@@ -203,6 +204,17 @@ class Corpus:
         self._quantizer = SignBitQuantizer(d=d, seed=seed)
         self._db_path = str(db_path)
 
+        # Load corpus mean if persisted by build(center=True).
+        mean_path = self._dir / _MEAN_NAME
+        if mean_path.exists():
+            self._mean: np.ndarray | None = np.load(mean_path)
+            if self._mean.shape != (d,):
+                raise ValueError(
+                    f"mean.npy shape {self._mean.shape} does not match d={d}"
+                )
+        else:
+            self._mean = None
+
     # ------------------------------------------------------------------ #
     # Class-method constructors
     # ------------------------------------------------------------------ #
@@ -252,7 +264,12 @@ class Corpus:
             pass
 
         q = SignBitQuantizer(d=d, seed=seed)
-        enc_vectors = vectors - vectors.mean(axis=0) if center else vectors
+        if center:
+            corpus_mean = vectors.mean(axis=0)
+            enc_vectors = vectors - corpus_mean
+        else:
+            corpus_mean = None
+            enc_vectors = vectors
         codes = q.encode(enc_vectors)  # (n, d//8) uint8
 
         bin_path = dest / _BIN_NAME
@@ -264,6 +281,17 @@ class Corpus:
             os.chmod(bin_path, 0o600)
         except OSError:
             pass
+
+        # Persist the corpus mean so search() can auto-center queries.
+        mean_path = dest / _MEAN_NAME
+        if corpus_mean is not None:
+            np.save(mean_path, corpus_mean.astype(np.float64))
+            try:
+                os.chmod(mean_path, 0o600)
+            except OSError:
+                pass
+        else:
+            mean_path.unlink(missing_ok=True)
 
         db_path = dest / _DB_NAME
         # missing_ok=True avoids a TOCTOU race with exists()/unlink().
@@ -291,9 +319,18 @@ class Corpus:
     # ------------------------------------------------------------------ #
 
     def search(self, query: np.ndarray, k: int = 10) -> list[Result]:
-        """Return the top-k nearest neighbours with resolved metadata."""
+        """Return the top-k nearest neighbours with resolved metadata.
+
+        When the corpus was built with ``center=True``, the stored corpus
+        mean is automatically subtracted from the query before encoding.
+        Callers do **not** need to center queries manually.
+        """
         if k <= 0:
             return []
+
+        query = np.asarray(query, dtype=np.float64)
+        if self._mean is not None:
+            query = query - self._mean
 
         indices, distances = self._quantizer.search(
             query, self._codes, k=k, return_distances=True
@@ -371,5 +408,19 @@ class Corpus:
     def codes(self) -> np.ndarray:
         return self._codes
 
+    @property
+    def mean(self) -> np.ndarray | None:
+        """Corpus mean vector, or None if the corpus was not centered.
+
+        Returns a copy to prevent accidental mutation.
+        """
+        return self._mean.copy() if self._mean is not None else None
+
+    @property
+    def centered(self) -> bool:
+        """Whether this corpus was built with ``center=True``."""
+        return self._mean is not None
+
     def __repr__(self) -> str:
-        return f"Corpus(n={self.n}, d={self.d}, path={str(self._dir)!r})"
+        c = ", centered" if self.centered else ""
+        return f"Corpus(n={self.n}, d={self.d}{c}, path={str(self._dir)!r})"
