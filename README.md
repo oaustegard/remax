@@ -22,6 +22,8 @@ v0.0.0 — repo scaffolded, work tracked in [issues](https://github.com/oaustega
 
 **Crossover plot vs remex**: [`bench/results/CROSSOVER.md`](bench/results/CROSSOVER.md). Reproduce with `python bench/crossover.py`. Side-by-side R@10 of remax stacked SimHash vs remex Lloyd-Max (Matryoshka extraction) at matched bits-per-dim — the publishable artifact for the rank-correct precision ladder claim.
 
+**Stage-2 rerank experiment**: [`bench/results/RERANK.md`](bench/results/RERANK.md). Reproduce with `pip install -e .[rerank] && bash bench/fetch_specter2_cache.sh && python bench/run_rerank.py`. Cross-encoder (`ms-marco-MiniLM-L-6-v2`, ONNX Runtime CPU) vs float32 inner-product on the candidate set produced by centred 1-bit Hamming stage 1. Answers the open question from [the Matryoshka post](https://muninn.austegard.com/blog/matryoshka-doesnt-buy-you-sign-bit-compression.html): does a dedicated cross-encoder beat float32-IP rerank on sign-bit candidates?
+
 ## Relationship to remex
 
 [remex](https://github.com/oaustegard/remex) is the multi-precision Lloyd-Max + Matryoshka library it shares lineage with. remex is a Swiss Army knife optimized for storage MSE, with rank-correct 1-bit *as a free MSB extraction*. remax is a chisel optimized for rank, exclusively.

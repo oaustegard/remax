@@ -151,3 +151,92 @@ def test_load_dataset_unknown_name_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(datasets, "_CACHE_ROOT", tmp_path)
     with pytest.raises(ValueError):
         datasets.load_dataset("not-a-real-dataset")
+
+
+# --------------------------------------------------------------------- #
+# texts_path / load_texts
+# --------------------------------------------------------------------- #
+
+
+def _write_texts(monkeypatch, tmp_path, name, items):
+    """Helper: write a fake texts.json cache for ``name`` under tmp_path."""
+    monkeypatch.setattr(datasets, "_CACHE_ROOT", tmp_path)
+    p = datasets.texts_path(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(items), encoding="utf-8")
+    return items
+
+
+def test_specter2_spec_advertises_texts():
+    """SPECTER2 ships a texts companion; the registry must expose that."""
+    spec = datasets.dataset_spec("SPECTER2")
+    assert spec.has_texts is True
+
+
+def test_glove_and_minilm_have_no_texts():
+    """The other datasets in the registry don't ship text in v0.1.0."""
+    assert datasets.dataset_spec("MiniLM-L6-v2").has_texts is False
+    assert datasets.dataset_spec("GloVe-300d").has_texts is False
+
+
+def test_texts_path_under_cache_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(datasets, "_CACHE_ROOT", tmp_path)
+    p = datasets.texts_path("SPECTER2")
+    assert isinstance(p, Path)
+    assert tmp_path in p.parents
+    assert p.name == "texts.json"
+    assert "SPECTER2" in str(p)
+
+
+def test_texts_path_raises_for_dataset_without_texts(monkeypatch, tmp_path):
+    monkeypatch.setattr(datasets, "_CACHE_ROOT", tmp_path)
+    with pytest.raises(ValueError, match="no registered texts"):
+        datasets.texts_path("MiniLM-L6-v2")
+
+
+def test_load_texts_reads_full_cache_when_n_none(monkeypatch, tmp_path):
+    items = [f"doc {i}" for i in range(7)]
+    _write_texts(monkeypatch, tmp_path, "SPECTER2", items)
+    out, info = datasets.load_texts("SPECTER2")
+    assert out == items
+    assert info == {"name": "SPECTER2", "n": 7}
+
+
+def test_load_texts_slices_to_n(monkeypatch, tmp_path):
+    items = [f"doc {i}" for i in range(20)]
+    _write_texts(monkeypatch, tmp_path, "SPECTER2", items)
+    out, info = datasets.load_texts("SPECTER2", n=5)
+    assert out == items[:5]
+    assert info["n"] == 5
+
+
+def test_load_texts_n_too_large_raises(monkeypatch, tmp_path):
+    _write_texts(monkeypatch, tmp_path, "SPECTER2", ["a", "b", "c"])
+    with pytest.raises(ValueError, match="texts cache has"):
+        datasets.load_texts("SPECTER2", n=10)
+
+
+def test_load_texts_missing_cache_message_includes_fetcher(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(datasets, "_CACHE_ROOT", tmp_path)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        datasets.load_texts("SPECTER2")
+    msg = str(excinfo.value)
+    assert "SPECTER2" in msg
+    assert "fetch" in msg.lower()
+
+
+def test_load_texts_rejects_non_string_payload(monkeypatch, tmp_path):
+    monkeypatch.setattr(datasets, "_CACHE_ROOT", tmp_path)
+    p = datasets.texts_path("SPECTER2")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps([{"title": "x"}]), encoding="utf-8")
+    with pytest.raises(ValueError, match="list of strings"):
+        datasets.load_texts("SPECTER2")
+
+
+def test_load_texts_unsupported_dataset_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(datasets, "_CACHE_ROOT", tmp_path)
+    with pytest.raises(ValueError, match="no registered texts"):
+        datasets.load_texts("MiniLM-L6-v2")

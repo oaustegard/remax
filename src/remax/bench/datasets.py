@@ -17,13 +17,20 @@ Caches are produced by:
 
 If a cache is missing, :func:`load_dataset` raises :class:`FileNotFoundError`
 with a remediation hint pointing at the fetcher script.
+
+Some datasets also ship the source text (titles + abstracts for SPECTER2),
+needed by stage-2 cross-encoder rerank experiments. These live alongside the
+embeddings as ``<_CACHE_ROOT>/<NAME>/texts.json`` and are loaded with
+:func:`load_texts`. Datasets without a registered text cache raise
+:class:`ValueError` from :func:`texts_path` / :func:`load_texts`.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -33,6 +40,8 @@ __all__ = [
     "dataset_spec",
     "dataset_path",
     "load_dataset",
+    "texts_path",
+    "load_texts",
 ]
 
 
@@ -73,11 +82,17 @@ _CACHE_ROOT: Path = _default_cache_root()
 
 @dataclass(frozen=True)
 class DatasetSpec:
-    """Static metadata for a registered dataset."""
+    """Static metadata for a registered dataset.
+
+    ``has_texts`` is true when a ``texts.json`` companion is published in the
+    same release as the embeddings. The cross-encoder rerank experiment
+    (issue #20) needs source text and only runs on text-bearing datasets.
+    """
 
     name: str
     dim: int
     fetcher_hint: str
+    has_texts: bool = False
 
 
 _REGISTRY: dict[str, DatasetSpec] = {
@@ -85,6 +100,7 @@ _REGISTRY: dict[str, DatasetSpec] = {
         name="SPECTER2",
         dim=768,
         fetcher_hint="bash bench/fetch_specter2_cache.sh",
+        has_texts=True,
     ),
     "MiniLM-L6-v2": DatasetSpec(
         name="MiniLM-L6-v2",
@@ -179,3 +195,77 @@ def load_dataset(
     arr = np.ascontiguousarray(arr, dtype=np.float32)
     info = {"name": spec.name, "dim": spec.dim, "n": int(arr.shape[0])}
     return arr, info
+
+
+# --------------------------------------------------------------------- #
+# Texts
+# --------------------------------------------------------------------- #
+
+
+def texts_path(name: str) -> Path:
+    """Deterministic absolute path to a dataset's cached ``texts.json``.
+
+    Raises :class:`ValueError` if the dataset does not have a registered text
+    companion (``has_texts=False``).
+    """
+    spec = dataset_spec(name)
+    if not spec.has_texts:
+        raise ValueError(
+            f"dataset {name!r} has no registered texts cache; "
+            f"only datasets with has_texts=True can supply source text."
+        )
+    return _CACHE_ROOT / spec.name / "texts.json"
+
+
+def load_texts(name: str, n: Optional[int] = None) -> Tuple[List[str], dict]:
+    """Load (and optionally slice) the cached source texts for ``name``.
+
+    The texts file is a JSON list of strings, aligned by index with the
+    embeddings array. For SPECTER2 each entry is ``"<title> [SEP] <abstract>"``
+    as encoded into the upstream embedding.
+
+    Parameters
+    ----------
+    name : str
+        One of :func:`available_datasets` with ``has_texts=True``.
+    n : int | None
+        If given, return only the first ``n`` entries. Raises if the cache
+        has fewer than ``n`` entries.
+
+    Returns
+    -------
+    texts : list[str]
+    info : dict
+        ``{"name": str, "n": int}``.
+
+    Raises
+    ------
+    FileNotFoundError
+        Texts cache does not exist. Message names the missing path and the
+        fetcher hint registered for ``name``.
+    ValueError
+        Unknown ``name``, dataset has no text cache, or ``n`` exceeds the
+        cache.
+    """
+    spec = dataset_spec(name)  # validates name
+    path = texts_path(name)  # validates has_texts
+    if not path.exists():
+        raise FileNotFoundError(
+            f"missing {name} texts cache at {path}\n"
+            f"to fix: {spec.fetcher_hint}"
+        )
+
+    with open(path, "r", encoding="utf-8") as fh:
+        items = json.load(fh)
+    if not isinstance(items, list) or not all(isinstance(t, str) for t in items):
+        raise ValueError(
+            f"{name} texts cache at {path} is not a JSON list of strings."
+        )
+    if n is not None:
+        if n > len(items):
+            raise ValueError(
+                f"texts cache has {len(items)} entries; n={n} requested."
+            )
+        items = items[:n]
+    info = {"name": spec.name, "n": int(len(items))}
+    return items, info
