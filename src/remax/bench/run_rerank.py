@@ -1,4 +1,4 @@
-"""Stage-2 rerank experiment driver (issue #20).
+"""Stage-2 rerank experiment driver (issue #20 + PR #22 follow-up).
 
 Question: on the candidate set produced by centred 1-bit Hamming stage 1,
 does a cross-encoder rerank recover R@10 better than float32 inner-product
@@ -8,6 +8,11 @@ Pipeline (per query):
     stage 1   centred 1-bit SimHash → top-N indices (N defaults to 100)
     stage 2a  float32 inner-product rerank of those N → R@10
     stage 2b  cross-encoder rerank of those N         → R@10
+              (one row per cross-encoder; the harness accepts any number)
+
+The multi-cross-encoder shape is the PR #22 follow-up: it lets a
+domain-matched reranker (e.g. SciBERT-finetuned MS MARCO) sit alongside
+the off-the-shelf ms-marco MiniLM in the same RERANK.md table.
 
 Stage 1 R@10 (raw Hamming) and stage 1 R@N (the candidate ceiling — no
 reranker can recover what stage 1 dropped) are reported alongside.
@@ -75,6 +80,29 @@ def _split_indices(
     return perm[n_queries:], perm[:n_queries]
 
 
+def _normalize_cross_encoders(
+    cross_encoder: Optional[object],
+    cross_encoders: Optional[Sequence[object]],
+) -> list:
+    """Resolve the legacy singular kwarg + the new plural one to a list.
+
+    Exactly one of ``cross_encoder`` / ``cross_encoders`` may be supplied.
+    If neither is, default to a single fresh :class:`CrossEncoderReranker`.
+    """
+    if cross_encoder is not None and cross_encoders is not None:
+        raise ValueError(
+            "pass either cross_encoder= or cross_encoders=, not both"
+        )
+    if cross_encoders is not None:
+        ce_list = list(cross_encoders)
+        if not ce_list:
+            raise ValueError("cross_encoders must contain at least one entry")
+        return ce_list
+    if cross_encoder is not None:
+        return [cross_encoder]
+    return [CrossEncoderReranker()]
+
+
 def run_rerank_experiment(
     *,
     emb: np.ndarray,
@@ -83,7 +111,8 @@ def run_rerank_experiment(
     top_n: int = DEFAULT_TOP_N,
     k_eval: int = DEFAULT_K_EVAL,
     seed: int = DEFAULT_SEED,
-    cross_encoder: Optional[CrossEncoderReranker] = None,
+    cross_encoder: Optional[object] = None,
+    cross_encoders: Optional[Sequence[object]] = None,
 ) -> dict:
     """Run the full stage-1 + stage-2a + stage-2b experiment.
 
@@ -100,19 +129,24 @@ def run_rerank_experiment(
     seed : int
         Master seed for the SimHash rotation.
     cross_encoder : CrossEncoderReranker | None
-        Pre-built reranker. Defaults to a fresh
-        ``CrossEncoderReranker()``. Pass an explicit instance to override
-        the model id, batch size, or max length.
+        Single cross-encoder (legacy single-row form). Mutually exclusive
+        with ``cross_encoders``.
+    cross_encoders : sequence of CrossEncoderReranker | None
+        One or more rerankers — each contributes a stage-2b row to the
+        result. Each must expose ``.model_id``, ``.prepare()`` and
+        ``.rerank(query_text=, candidate_idx=, candidate_texts=, k=)``.
 
     Returns
     -------
     dict
         Keys: ``n_corpus``, ``n_queries``, ``d``, ``top_n``, ``k_eval``,
         ``stage1_recall_at_k``, ``stage1_recall_at_topn``,
-        ``stage2a_recall_at_k``, ``stage2b_recall_at_k``,
-        ``stage2a_latency_s_per_q``, ``stage2b_latency_s_per_q``,
-        ``cross_encoder_model``.
+        ``stage2a_recall_at_k``, ``stage2a_latency_s_per_q``,
+        ``stage2b_results`` (list of per-cross-encoder dicts with
+        ``model_id``, ``recall_at_k``, ``latency_s_per_q``).
     """
+    ce_list = _normalize_cross_encoders(cross_encoder, cross_encoders)
+
     emb = np.asarray(emb)
     if emb.ndim != 2:
         raise ValueError(f"emb must be 2-D, got shape {emb.shape}")
@@ -169,24 +203,27 @@ def run_rerank_experiment(
     stage2a_total = time.perf_counter() - t0
     stage2a_r_at_k = recall_at_k(stage2a_pred, truth, k=k_eval)
 
-    # Stage 2b: cross-encoder rerank.
-    if cross_encoder is None:
-        cross_encoder = CrossEncoderReranker()
-    cross_encoder.prepare()  # exclude one-time model load from latency
-
-    stage2b_pred = np.empty((n_queries, k_eval), dtype=np.intp)
-    t0 = time.perf_counter()
-    for i in range(n_queries):
-        cand = stage1_pred[i]
-        cand_texts = [corpus_texts[int(j)] for j in cand]
-        stage2b_pred[i] = cross_encoder.rerank(
-            query_text=query_texts[i],
-            candidate_idx=cand,
-            candidate_texts=cand_texts,
-            k=k_eval,
-        )
-    stage2b_total = time.perf_counter() - t0
-    stage2b_r_at_k = recall_at_k(stage2b_pred, truth, k=k_eval)
+    # Stage 2b: cross-encoder rerank — one row per CE.
+    stage2b_results: list[dict] = []
+    for ce in ce_list:
+        ce.prepare()  # exclude one-time model load from latency
+        pred = np.empty((n_queries, k_eval), dtype=np.intp)
+        t0 = time.perf_counter()
+        for i in range(n_queries):
+            cand = stage1_pred[i]
+            cand_texts = [corpus_texts[int(j)] for j in cand]
+            pred[i] = ce.rerank(
+                query_text=query_texts[i],
+                candidate_idx=cand,
+                candidate_texts=cand_texts,
+                k=k_eval,
+            )
+        total = time.perf_counter() - t0
+        stage2b_results.append({
+            "model_id": ce.model_id,
+            "recall_at_k": float(recall_at_k(pred, truth, k=k_eval)),
+            "latency_s_per_q": float(total / n_queries),
+        })
 
     return {
         "n_corpus": n_corpus,
@@ -197,10 +234,8 @@ def run_rerank_experiment(
         "stage1_recall_at_k": float(stage1_r_at_k),
         "stage1_recall_at_topn": float(stage1_r_at_topn),
         "stage2a_recall_at_k": float(stage2a_r_at_k),
-        "stage2b_recall_at_k": float(stage2b_r_at_k),
         "stage2a_latency_s_per_q": float(stage2a_total / n_queries),
-        "stage2b_latency_s_per_q": float(stage2b_total / n_queries),
-        "cross_encoder_model": cross_encoder.model_id,
+        "stage2b_results": stage2b_results,
     }
 
 
@@ -217,13 +252,21 @@ def _fmt_ms(s: float) -> str:
     return f"{s * 1000:.1f} ms"
 
 
+def _short_model_id(model_id: str) -> str:
+    """Strip the HF org prefix for tighter table cells.
+
+    ``cross-encoder/ms-marco-MiniLM-L-6-v2`` → ``ms-marco-MiniLM-L-6-v2``
+    """
+    return model_id.split("/", 1)[-1]
+
+
 def format_rerank_md(
     *,
     result: Mapping,
     dataset: str,
     seed: int,
 ) -> str:
-    """Render a single experiment result as RERANK.md."""
+    """Render an experiment result with N stage-2b rows as RERANK.md."""
     k = result["k_eval"]
     n = result["top_n"]
     # Stage-2 ceiling at K is the fraction of true top-K that lives inside
@@ -232,6 +275,8 @@ def format_rerank_md(
     # bounded above by this number whenever its relevance judgments
     # disagree with float32-IP.
     stage2_ceiling = result["stage2a_recall_at_k"]
+    stage2b_rows: Sequence[Mapping] = result["stage2b_results"]
+    stage2a_lat = result["stage2a_latency_s_per_q"]
 
     lines: List[str] = []
     lines.append(
@@ -252,10 +297,17 @@ def format_rerank_md(
         f"under the float32-IP truth metric, the *optimal* reranker over "
         f"the candidate set)."
     )
-    lines.append(
-        f"- **Stage 2b**: cross-encoder rerank — `{result['cross_encoder_model']}` "
-        f"via ONNX Runtime CPU."
-    )
+    if len(stage2b_rows) == 1:
+        lines.append(
+            f"- **Stage 2b**: cross-encoder rerank — "
+            f"`{stage2b_rows[0]['model_id']}` via ONNX Runtime CPU."
+        )
+    else:
+        lines.append(
+            f"- **Stage 2b**: cross-encoder rerank — "
+            f"{len(stage2b_rows)} models compared "
+            f"(see table). All run via ONNX Runtime CPU."
+        )
     lines.append(
         f"- **Metric**: R@{k} vs float32 inner-product ground truth on the "
         f"raw (un-centered) corpus."
@@ -267,22 +319,36 @@ def format_rerank_md(
     lines.append("")
     lines.append("### Recall and latency")
     lines.append("")
-    lines.append(f"| stage                        | R@{k:<3d}| latency / query |")
-    lines.append("|------------------------------|-------|-----------------|")
+    # Width the stage label column to fit the longest CE model id row.
+    ce_label_template = "stage 2b ({})"
+    longest_label = max(
+        [len("stage 1 (raw 1-bit Hamming)"),
+         len("stage 2a (float32-IP rerank)")]
+        + [len(ce_label_template.format(_short_model_id(r["model_id"])))
+           for r in stage2b_rows]
+    )
+    stage_w = max(longest_label, 28)
+    pad = lambda s: s.ljust(stage_w)
+    sep_dashes = "-" * stage_w
+
+    lines.append(f"| {pad('stage')} | R@{k:<3d}| latency / query |")
+    lines.append(f"|{sep_dashes}--|-------|-----------------|")
     lines.append(
-        f"| stage 1 (raw 1-bit Hamming)  | "
+        f"| {pad('stage 1 (raw 1-bit Hamming)')} | "
         f"{_fmt_pct(result['stage1_recall_at_k'])} | (n/a)           |"
     )
     lines.append(
-        f"| stage 2a (float32-IP rerank) | "
+        f"| {pad('stage 2a (float32-IP rerank)')} | "
         f"{_fmt_pct(result['stage2a_recall_at_k'])} | "
-        f"{_fmt_ms(result['stage2a_latency_s_per_q']):<15s} |"
+        f"{_fmt_ms(stage2a_lat):<15s} |"
     )
-    lines.append(
-        f"| stage 2b (cross-encoder)     | "
-        f"{_fmt_pct(result['stage2b_recall_at_k'])} | "
-        f"{_fmt_ms(result['stage2b_latency_s_per_q']):<15s} |"
-    )
+    for row in stage2b_rows:
+        label = ce_label_template.format(_short_model_id(row["model_id"]))
+        lines.append(
+            f"| {pad(label)} | "
+            f"{_fmt_pct(row['recall_at_k'])} | "
+            f"{_fmt_ms(row['latency_s_per_q']):<15s} |"
+        )
     lines.append("")
     lines.append(
         f"**Stage-2 R@{k} ceiling (= stage 2a):** "
@@ -309,18 +375,23 @@ def format_rerank_md(
         f"{_fmt_pct(result['stage2a_recall_at_k'])} after float32-IP rerank "
         f"of the top-{n} candidates — almost all of the recall sign-bit "
         f"stage 1 left on the table is recoverable, at "
-        f"{_fmt_ms(result['stage2a_latency_s_per_q'])} per query. The "
+        f"{_fmt_ms(stage2a_lat)} per query. The "
         f"sign-bit + float32-IP-rerank pipeline is essentially a lossless "
         f"R@{k} approximation of full float32 search at this n / top-{n}."
     )
     lines.append("")
+    # Per-CE narrative — pick the slowest / lowest-recall row to anchor the
+    # legacy off-the-shelf paragraph; let any extra rows speak in their own
+    # row instead of rewriting the whole section.
+    primary = stage2b_rows[0]
+    speedup = primary["latency_s_per_q"] / max(stage2a_lat, 1e-9)
     lines.append(
-        f"**Off-the-shelf cross-encoder doesn't.** Stage 2b achieves "
-        f"R@{k} = {_fmt_pct(result['stage2b_recall_at_k'])} at "
-        f"~{_fmt_ms(result['stage2b_latency_s_per_q'])} per query — strictly "
+        f"**Off-the-shelf cross-encoder doesn't.** "
+        f"`{_short_model_id(primary['model_id'])}` achieves "
+        f"R@{k} = {_fmt_pct(primary['recall_at_k'])} at "
+        f"~{_fmt_ms(primary['latency_s_per_q'])} per query — strictly "
         f"worse than the float32-IP baseline, and "
-        f"{result['stage2b_latency_s_per_q'] / max(result['stage2a_latency_s_per_q'], 1e-9):.0f}× "
-        f"slower. Two confounders worth naming:"
+        f"{speedup:.0f}× slower. Two confounders worth naming:"
     )
     lines.append("")
     lines.append(
@@ -331,14 +402,29 @@ def format_rerank_md(
         "wrong by definition under this metric."
     )
     lines.append(
-        "2. **Domain mismatch.** `ms-marco-MiniLM-L-6-v2` is trained on "
-        "short web search query → web document relevance. Both "
+        "2. **Domain mismatch.** Off-the-shelf MS MARCO cross-encoders are "
+        "trained on short web search query → web document relevance. Both "
         "\"query\" and \"document\" here are full SPECTER2 paper records "
         "(title + abstract, hundreds of tokens). The model is being asked "
         "to do paper–paper semantic similarity in a regime it never saw "
         "during pretraining."
     )
     lines.append("")
+    if len(stage2b_rows) > 1:
+        lines.append(
+            "**Comparing across cross-encoders.** The extra rows above "
+            "exist to test confounder #2 directly: a domain-matched "
+            "reranker (e.g. a SciBERT-trained MS MARCO cross-encoder) "
+            "should narrow — or, in principle, close — the gap to "
+            "float32-IP. None of the rows above can exceed the stage-2 "
+            f"R@{k} ceiling of {_fmt_pct(stage2_ceiling)}; what they "
+            "*can* do is approach it more closely than the off-the-shelf "
+            "MiniLM, while paying broadly similar per-query latency. "
+            "If a domain-matched row sits at parity with stage 2a, the "
+            "remaining gap to a notional human-judged truth metric is "
+            "what's left to study."
+        )
+        lines.append("")
     lines.append(
         "The result isn't that cross-encoders are bad; it's that the "
         f"interesting comparison for this corpus needs (a) a domain-matched "
@@ -369,7 +455,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     p = argparse.ArgumentParser(
         prog="remax-bench-rerank",
         description=(
-            "Cross-encoder vs float32-IP rerank on sign-bit stage-1 candidates."
+            "Cross-encoder vs float32-IP rerank on sign-bit stage-1 "
+            "candidates. Pass --cross-encoder-model multiple times to "
+            "compare several rerankers (e.g. an off-the-shelf MS MARCO "
+            "CE alongside a domain-matched SciBERT-trained one)."
         ),
     )
     p.add_argument(
@@ -397,8 +486,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         help=f"quantizer rotation seed (default: {DEFAULT_SEED})",
     )
     p.add_argument(
-        "--cross-encoder-model", type=str, default=DEFAULT_CROSS_ENCODER,
-        help=f"HF Hub model id (default: {DEFAULT_CROSS_ENCODER})",
+        "--cross-encoder-model",
+        action="append",
+        default=None,
+        help=(
+            "HF Hub model id for a cross-encoder (publishing "
+            "onnx/model.onnx + tokenizer.json). May be passed multiple "
+            f"times — each becomes a stage-2b row. Default: "
+            f"{DEFAULT_CROSS_ENCODER}."
+        ),
     )
     p.add_argument(
         "--batch-size", type=int, default=32,
@@ -430,16 +526,22 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         f"[run]  n={einfo['n']} d={einfo['dim']} "
         f"queries={args.queries} top_n={args.top_n} k_eval={args.k_eval}\n"
     )
-    sys.stderr.write(
-        f"[ce]   {args.cross_encoder_model} (preparing ONNX session)\n"
-    )
 
-    ce = CrossEncoderReranker(
-        model_id=args.cross_encoder_model,
-        max_length=args.max_length,
-        batch_size=args.batch_size,
+    model_ids: list[str] = (
+        args.cross_encoder_model
+        if args.cross_encoder_model
+        else [DEFAULT_CROSS_ENCODER]
     )
-    ce.prepare()
+    ces: list[CrossEncoderReranker] = []
+    for mid in model_ids:
+        sys.stderr.write(f"[ce]   {mid} (preparing ONNX session)\n")
+        ce = CrossEncoderReranker(
+            model_id=mid,
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+        )
+        ce.prepare()
+        ces.append(ce)
 
     result = run_rerank_experiment(
         emb=emb,
@@ -448,7 +550,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         top_n=args.top_n,
         k_eval=args.k_eval,
         seed=args.seed,
-        cross_encoder=ce,
+        cross_encoders=ces,
     )
 
     sys.stderr.write(
@@ -459,10 +561,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         f"       stage2a R@{result['k_eval']}={result['stage2a_recall_at_k']:.3f}  "
         f"({result['stage2a_latency_s_per_q'] * 1000:.1f} ms/q)\n"
     )
-    sys.stderr.write(
-        f"       stage2b R@{result['k_eval']}={result['stage2b_recall_at_k']:.3f}  "
-        f"({result['stage2b_latency_s_per_q'] * 1000:.1f} ms/q)\n"
-    )
+    for row in result["stage2b_results"]:
+        sys.stderr.write(
+            f"       stage2b ({_short_model_id(row['model_id'])}) "
+            f"R@{result['k_eval']}={row['recall_at_k']:.3f}  "
+            f"({row['latency_s_per_q'] * 1000:.1f} ms/q)\n"
+        )
 
     md = format_rerank_md(
         result=result, dataset=args.dataset, seed=args.seed
