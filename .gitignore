@@ -16,6 +16,8 @@ bench/.cache/
 bench/results/*
 !bench/results/.gitkeep
 !bench/results/BASELINE.md
+!bench/results/SKETCH_MATRYOSHKA.md
+!bench/results/SKETCH_MATRYOSHKA_GEMINI.md
 
 # IDE
 .vscode/
