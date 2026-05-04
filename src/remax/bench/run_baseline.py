@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 
@@ -34,7 +35,8 @@ import numpy as np
 
 from remax import SignBitQuantizer, StackedSignBitQuantizer
 from remax.bench import datasets
-from remax.bench.eval import evaluate_quantizer, exact_knn
+from remax.bench.eval import evaluate_quantizer, exact_knn, recall_at_k
+from remax.corpus import Corpus
 
 __all__ = [
     "LADDER_KS",
@@ -143,12 +145,16 @@ def compute_baseline_for_embeddings(
 
     row: dict = {"dataset": name, "n": int(corpus.shape[0]), "d": d}
 
-    # 1-bit
-    q1 = SignBitQuantizer(d=d, seed=seed)
-    res1 = evaluate_quantizer(
-        q1, corpus_enc, queries_enc, k_eval=k_eval, truth=truth
-    )
-    row["1-bit"] = res1["recall_at_k"]
+    # 1-bit — use Corpus to prove the metadata layer works end-to-end.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ids = [str(i) for i in range(corpus_enc.shape[0])]
+        c = Corpus.build(tmpdir, corpus_enc, ids, d=d, seed=seed)
+        pred_ids = []
+        for q_vec in queries_enc:
+            results = c.search(q_vec, k=k_eval)
+            pred_ids.append([int(r.record_id) for r in results])
+        pred_arr = np.array(pred_ids, dtype=np.intp)
+    row["1-bit"] = recall_at_k(pred_arr, truth, k=k_eval)
 
     # Stacked ladder
     for k in LADDER_KS:
