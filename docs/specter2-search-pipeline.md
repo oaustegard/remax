@@ -54,17 +54,22 @@ corpus_vectors, corpus_ids = load_s2_embeddings(
 
 ## 2. Build the Corpus (offline, once)
 
+Truncate to the first 256 dimensions before building. SPECTER2's
+information is distributed roughly uniformly across dimensions (it is
+*not* Matryoshka-trained, but empirically any 256 of its 768 dims
+work equally well — see the
+[Three Gigs](https://muninn.austegard.com/blog/three-gigs-to-search-a-hundred-million-papers.html)
+experiment). This cuts storage from 96 to **32 bytes per vector** with
+R@100 = 0.926 against float32 inner-product ground truth.
+
 ```python
 from remax import Corpus
 
-# Build the index. center=True subtracts the corpus mean before
-# sign-packing AND persists the mean as mean.npy so that search()
-# can auto-center queries. This is load-bearing for retrieval
-# quality. (Raw SPECTER2: R@10 ≈ 0.47; centered: R@10 ≈ 0.64
-# on the v0.1.0 bench.)
+TRUNC = 256  # dims to keep; 256 is the sweet spot
+
 corpus = Corpus.build(
     "my_index",
-    vectors=corpus_vectors,
+    vectors=corpus_vectors[:, :TRUNC],
     ids=corpus_ids,
     seed=42,
     center=True,
@@ -75,8 +80,19 @@ corpus = Corpus.build(
 #   my_index/mean.npy   — corpus mean vector (only when center=True)
 ```
 
-On-disk footprint: 768 / 8 = **96 bytes per vector** plus the
-32-byte header. A 1M-paper corpus is ~92 MB of codes.
+`center=True` subtracts the corpus mean before sign-packing AND
+persists it as `mean.npy` so that `search()` can auto-center queries.
+Centering is load-bearing: without it, R@10 drops from 0.468 to 0.336
+at k=256.
+
+On-disk footprint: 256 / 8 = **32 bytes per vector**. 100M papers ×
+32 bytes = **3.2 GB**. mmap it; XOR + popcount returns top-100
+candidates in well under a second single-threaded.
+
+If you need the full 768 dimensions for stage-2 reranking, keep the
+original `corpus_vectors` accessible (S3, Postgres,
+[S3 Vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html),
+or a local file).
 
 ## 3. Encode Queries and Search
 
@@ -95,6 +111,7 @@ query_model = AutoModel.from_pretrained("allenai/specter2_base")
 query_model.load_adapter("allenai/specter2_adhoc_query", source="hf", set_active=True)
 query_model.eval()
 
+TRUNC = 256  # must match the corpus build
 
 def encode_query(text: str) -> np.ndarray:
     """Encode a search query with the SPECTER2 adhoc_query adapter."""
@@ -109,7 +126,7 @@ def encode_query(text: str) -> np.ndarray:
         out = query_model(**inputs)
     mask = inputs["attention_mask"].unsqueeze(-1).float()
     emb = (out.last_hidden_state * mask).sum(1) / mask.sum(1)
-    return emb[0].cpu().numpy().astype(np.float32)
+    return emb[0].cpu().numpy().astype(np.float32)[:TRUNC]
 ```
 
 > **Why `adhoc_query` and not `proximity`?** SPECTER2 ships separate
@@ -141,58 +158,64 @@ for r in results[:5]:
 
 Output (illustrative):
 ```
-  #0  d=287  204838007
-  #1  d=291  261100919
-  #2  d=294  249063163
-  #3  d=296  215416146
-  #4  d=298  259950998
+  #0  d=87  204838007
+  #1  d=91  261100919
+  #2  d=94  249063163
+  #3  d=96  215416146
+  #4  d=98  259950998
 ```
 
-Distances are Hamming (number of bit disagreements out of 768).
-Lower = more similar. Theoretical range: 0 to 768. The `record_id`
+Distances are Hamming (number of bit disagreements out of 256).
+Lower = more similar. Theoretical range: 0 to 256. The `record_id`
 is the S2 Corpus ID — resolve to metadata via the
 [S2 Paper API](https://api.semanticscholar.org/api-docs/graph#tag/Paper-Data/operation/get_graph_get_paper).
 
-## 4. Stage 2 Rerank (optional)
+## 4. Stage 2 Rerank
 
-The 100 candidates from remax are coarse. For a production pipeline,
-rerank them with full-precision scores — either via remex or a
-cross-encoder:
+The 100 candidates from remax are a coarse filter. Rerank against
+full-precision vectors to recover near-perfect recall:
 
 ```python
-# Option A: remex asymmetric inner-product rerank
-from remex import Quantizer
+# Float32 inner-product rerank — fast and effective.
+# Look up the full 768-d embeddings for the 100 candidates.
+candidate_ids = [r.record_id for r in results]
+candidate_vecs = lookup_full_embeddings(candidate_ids)  # (100, 768)
+query_full = encode_query_full(query_text)  # full 768-d, no truncation
 
-# Re-encode the candidate subset at higher precision
-candidate_indices = [int(r.record_id) for r in results]
-candidate_vecs = corpus_vectors[...]  # look up by corpus ID
-q = Quantizer(d=768, bits=4, seed=42)
-compressed = q.encode(candidate_vecs)
-final_idx, scores = q.search(compressed, query_vec, k=10)
-
-# Option B: cross-encoder rerank (slowest)
-from sentence_transformers import CrossEncoder
-
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2") #pick the best for your domain
-pairs = [(query_text, get_title_abstract(cid)) for cid in candidate_indices]
-scores = reranker.predict(pairs)
+scores = candidate_vecs @ query_full
 top10 = np.argsort(-scores)[:10]
+final_ids = [candidate_ids[i] for i in top10]
 ```
+
+On the v0.1.0 bench (SPECTER2, n=9900, 100 queries), this two-stage
+pipeline achieves R@10 = 0.983 at 0.1 ms per query for stage 2 — nearly
+all recall left on the table by the binary filter is recovered by a
+simple dot product.
+
+> **Why not a cross-encoder?** We benchmarked `cross-encoder/ms-marco-MiniLM-L-6-v2`
+> on this pipeline ([PR #23](https://github.com/oaustegard/remax/pull/23)):
+> R@10 = 0.305 at 5066 ms/query — strictly worse than float32-IP and
+> 50,000× slower. Two factors: (1) R@K is measured against float32-IP
+> ground truth, which float32-IP rerank optimises by definition; the
+> cross-encoder optimises a different signal. (2) `ms-marco-MiniLM` is
+> trained on short web queries, not paper↔paper similarity. A
+> domain-matched cross-encoder (SciBERT-trained) may close the gap, but
+> the burden of proof is on the cross-encoder to beat a dot product here.
 
 ## Notes
 
-**Centering matters.** SPECTER2 embeddings have non-zero per-dimension
-means (one dimension has mean ≈ 15.5). Charikar SimHash assumes
-mean-zero inputs. Centering closes the gap between naive sign-bit
-encoding and Lloyd-Max 1-bit quantization, which adaptively places
-its boundary at the per-dimension mean.
+**Centering is the biggest lever.** SPECTER2 embeddings have non-zero
+per-dimension means (one dimension has mean ≈ 15.5). At k=64,
+centering alone buys +0.324 R@100 — more than rotation, projection,
+or any other technique tested. `Corpus.build(center=True)` handles
+this and persists the mean for automatic query centering.
 
-**Centering is automatic.** `Corpus.build(center=True)` persists the
-corpus mean as `mean.npy`. On load, `Corpus` detects the mean file
-and `search()` subtracts it from queries before encoding. Callers
-pass raw encoder output — no manual centering step. The mean is
-accessible via `corpus.mean` if needed externally (e.g., for
-interop with the low-level `SignBitQuantizer` API).
+**Truncation costs less than you'd expect.** SPECTER2 is not
+Matryoshka-trained, yet truncating from 768 to 256 dims only drops
+R@100 from 0.988 to 0.926. Prefix, suffix, and random dimension
+selections all perform within noise of each other — the "first k
+dims are special" convention is just convention for this encoder.
+See [Three Gigs to Search a Hundred Million Papers](https://muninn.austegard.com/blog/three-gigs-to-search-a-hundred-million-papers.html).
 
 **Adapters matter for queries.** The S2 corpus was embedded with the
 proximity adapter. For search-style queries (short text → relevant
@@ -202,8 +225,13 @@ similarity (e.g., "find papers like this one"), use
 768-d vectors. A refreshed variant (`allenai/specter2_aug2023refresh_adhoc_query`)
 is also available with slightly newer training data.
 
-**Scaling.** At 100M vectors (the full S2 corpus), the index is
-~3.2 GB of packed codes. A brute-force Hamming scan is feasible on
-a single machine with NumPy. For sub-linear access, pair with
-remex's `IVFCoarseIndex` for cell routing (not yet integrated;
-tracked in the remax roadmap).
+**Scaling.** 100M vectors × 32 bytes = 3.2 GB. mmap the index file;
+XOR + popcount is a CPU instruction. Stage 2 needs access to full
+768-d embeddings for the ~100 candidates — store those in S3,
+Postgres, or [S3 Vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html).
+For sub-linear stage-1 access, pair with remex's `IVFCoarseIndex` for
+cell routing (not yet integrated; tracked in the remax roadmap).
+
+**Caveats.** All recall numbers are from 10,000 SPECTER2 embeddings —
+0.01% of the full S2 corpus. Nearest-neighbor distributions shift at
+100M scale. Treat specific numbers as directional, not final.
