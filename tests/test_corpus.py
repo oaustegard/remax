@@ -243,3 +243,111 @@ def test_repr():
         assert "Corpus" in r
         assert "n=5" in r
         assert "d=32" in r
+
+
+def test_repr_centered():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rng = np.random.default_rng(0)
+        vectors = rng.standard_normal((10, 64))
+        ids = [f"doc-{i}" for i in range(10)]
+        c = Corpus.build(tmpdir, vectors, ids, center=True)
+        r = repr(c)
+        assert "centered" in r
+
+
+# --------------------------------------------------------------------- #
+# 8. Centering — mean persistence and auto-centering
+# --------------------------------------------------------------------- #
+
+def _make_centered_corpus(
+    tmpdir,
+    n: int = 50,
+    d: int = 64,
+    seed: int = 0,
+) -> tuple[Corpus, np.ndarray, list[str]]:
+    rng = np.random.default_rng(seed)
+    vectors = rng.standard_normal((n, d)) + 5.0  # non-zero mean
+    ids = [f"doc-{i:04d}" for i in range(n)]
+    c = Corpus.build(tmpdir, vectors, ids, d=d, seed=seed, center=True)
+    return c, vectors, ids
+
+
+def test_center_saves_mean_file():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_centered_corpus(tmpdir)
+        assert (Path(tmpdir) / "mean.npy").exists()
+
+
+def test_no_center_no_mean_file():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_corpus(tmpdir)
+        assert not (Path(tmpdir) / "mean.npy").exists()
+
+
+def test_centered_property():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c, _, _ = _make_centered_corpus(tmpdir)
+        assert c.centered is True
+        assert c.mean is not None
+        assert c.mean.shape == (64,)
+
+
+def test_not_centered_property():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c, _, _ = _make_corpus(tmpdir)
+        assert c.centered is False
+        assert c.mean is None
+
+
+def test_mean_matches_corpus_mean():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c, vectors, _ = _make_centered_corpus(tmpdir)
+        expected_mean = vectors.mean(axis=0)
+        np.testing.assert_allclose(c.mean, expected_mean, rtol=1e-10)
+
+
+def test_mean_is_copy():
+    """Mutating the returned mean must not affect the corpus."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c, _, _ = _make_centered_corpus(tmpdir)
+        m = c.mean
+        m[:] = 999.0
+        np.testing.assert_array_less(c.mean, 900.0)  # not mutated
+
+
+def test_centered_search_self_retrieval():
+    """With centering, raw (un-centered) queries should still self-retrieve."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c, vectors, ids = _make_centered_corpus(tmpdir, n=50, d=64, seed=7)
+        # Pass the RAW vector — search() should auto-center.
+        for i in [0, 10, 49]:
+            results = c.search(vectors[i], k=1)
+            assert results[0].record_id == ids[i], (
+                f"Expected {ids[i]} at rank 0, got {results[0].record_id}"
+            )
+            assert results[0].distance == 0
+
+
+def test_centered_roundtrip():
+    """Reload a centered corpus and verify mean + search are preserved."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c1, vectors, ids = _make_centered_corpus(tmpdir, n=30, d=64, seed=3)
+        c2 = Corpus(tmpdir)
+
+        assert c2.centered is True
+        np.testing.assert_array_equal(c1.mean, c2.mean)
+
+        r1 = c1.search(vectors[0], k=5)
+        r2 = c2.search(vectors[0], k=5)
+        assert [r.record_id for r in r1] == [r.record_id for r in r2]
+        assert [r.distance for r in r1] == [r.distance for r in r2]
+
+
+def test_center_false_overwrites_mean():
+    """Rebuilding without centering should remove a stale mean.npy."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_centered_corpus(tmpdir)
+        assert (Path(tmpdir) / "mean.npy").exists()
+        # Rebuild without centering
+        _make_corpus(tmpdir)
+        assert not (Path(tmpdir) / "mean.npy").exists()
