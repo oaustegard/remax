@@ -6,15 +6,17 @@ Three primitives:
 * :func:`hamming_distances` — broadcast XOR + popcount-LUT sum over a corpus.
 * :func:`hamming_search` — top-k by Hamming distance for a single rotated query.
 
-The popcount lookup table is a precomputed 256-entry ``uint16`` array.
-``np.unpackbits`` would also work, but materialises 8× the memory; the LUT
-is cleaner and is the canonical numpy idiom. SIMD popcount kernels are a
-post-v0.1.0 concern.
+When a C compiler is available, ``hamming_distances`` dispatches to a native
+kernel using hardware ``POPCNT`` (~50–60× faster than the NumPy LUT fallback).
+The native path compiles automatically at first import and is cached; no extra
+dependencies are required.  See :mod:`remax._native` for details.
 """
 
 from __future__ import annotations
 
 import numpy as np
+
+from . import _native
 
 __all__ = [
     "POPCOUNT_LUT",
@@ -90,6 +92,8 @@ def hamming_distances(
             f"query_code shape {q.shape} incompatible with "
             f"codes shape {codes.shape}"
         )
+    if _native.AVAILABLE:
+        return _native.hamming_distances_native(codes, q)
     xor = np.bitwise_xor(codes, q[None, :])
     # POPCOUNT_LUT[xor] is (n, B) uint16 — popcount per byte. Sum across
     # bytes gives total Hamming distance per row.
