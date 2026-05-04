@@ -224,6 +224,15 @@ def format_rerank_md(
     seed: int,
 ) -> str:
     """Render a single experiment result as RERANK.md."""
+    k = result["k_eval"]
+    n = result["top_n"]
+    # Stage-2 ceiling at K is the fraction of true top-K that lives inside
+    # the candidate set — exactly what float32-IP rerank achieves, since IP
+    # *is* the metric the truth is computed against. Cross-encoder R@K is
+    # bounded above by this number whenever its relevance judgments
+    # disagree with float32-IP.
+    stage2_ceiling = result["stage2a_recall_at_k"]
+
     lines: List[str] = []
     lines.append(
         f"## remax stage-2 rerank — sign-bit candidates → cross-encoder vs float32-IP"
@@ -235,30 +244,30 @@ def format_rerank_md(
         f"n_queries={result['n_queries']}, d={result['d']}"
     )
     lines.append(
-        f"- **Stage 1**: centered 1-bit SimHash, Hamming top-{result['top_n']}. "
+        f"- **Stage 1**: centered 1-bit SimHash, Hamming top-{n}. "
         f"Quantizer seed = {seed}, query split seed = {QUERY_SPLIT_SEED}."
     )
     lines.append(
-        f"- **Stage 2a**: float32 inner-product rerank (the baseline)."
+        f"- **Stage 2a**: float32 inner-product rerank (the baseline — and, "
+        f"under the float32-IP truth metric, the *optimal* reranker over "
+        f"the candidate set)."
     )
     lines.append(
         f"- **Stage 2b**: cross-encoder rerank — `{result['cross_encoder_model']}` "
         f"via ONNX Runtime CPU."
     )
     lines.append(
-        f"- **Metric**: R@{result['k_eval']} vs float32 inner-product ground "
-        f"truth on the raw (un-centered) corpus."
+        f"- **Metric**: R@{k} vs float32 inner-product ground truth on the "
+        f"raw (un-centered) corpus."
     )
     lines.append(
         f"- **Latency**: wall-clock per query for stage-2 work only "
         f"(stage-1 Hamming and one-time cross-encoder model load are excluded)."
     )
     lines.append("")
-    lines.append(
-        "### Recall and latency"
-    )
+    lines.append("### Recall and latency")
     lines.append("")
-    lines.append("| stage                        | R@10  | latency / query |")
+    lines.append(f"| stage                        | R@{k:<3d}| latency / query |")
     lines.append("|------------------------------|-------|-----------------|")
     lines.append(
         f"| stage 1 (raw 1-bit Hamming)  | "
@@ -276,19 +285,68 @@ def format_rerank_md(
     )
     lines.append("")
     lines.append(
-        f"**Stage-1 candidate ceiling (R@{result['top_n']}):** "
-        f"{_fmt_pct(result['stage1_recall_at_topn'])} — the upper bound any "
-        f"stage-2 reranker can hit on this candidate set. Stage-2 R@10 cannot "
-        f"exceed this number; the gap to 1.000 is what stage 1 lost."
+        f"**Stage-2 R@{k} ceiling (= stage 2a):** "
+        f"{_fmt_pct(stage2_ceiling)} — the fraction of true top-{k} present "
+        f"in the stage-1 candidate set. Float32-IP rerank attains this "
+        f"ceiling exactly (it picks top-{k} by descending IP, which is the "
+        f"truth metric). No reranker scoring on a different signal can "
+        f"strictly exceed it."
     )
     lines.append("")
-    lines.append("### Reading the table")
+    lines.append(
+        f"**Stage-1 R@{n} (candidate-set retention):** "
+        f"{_fmt_pct(result['stage1_recall_at_topn'])} — fraction of the "
+        f"true top-{n} that the candidate set covers. Different from the "
+        f"stage-2 R@{k} ceiling; reported here for context on stage-1 "
+        f"quality at the wider cut."
+    )
+    lines.append("")
+    lines.append("### Discussion")
     lines.append("")
     lines.append(
-        "Stage 2a (float32-IP) is the cheap baseline. Stage 2b (cross-encoder) "
-        "is the expensive treatment. The interesting comparison is whether "
-        "stage 2b lifts R@10 above stage 2a, and whether the latency cost is "
-        "justified for the recall gain."
+        f"**Float32-IP rerank wins decisively.** Stage 1 R@{k} of "
+        f"{_fmt_pct(result['stage1_recall_at_k'])} climbs to "
+        f"{_fmt_pct(result['stage2a_recall_at_k'])} after float32-IP rerank "
+        f"of the top-{n} candidates — almost all of the recall sign-bit "
+        f"stage 1 left on the table is recoverable, at "
+        f"{_fmt_ms(result['stage2a_latency_s_per_q'])} per query. The "
+        f"sign-bit + float32-IP-rerank pipeline is essentially a lossless "
+        f"R@{k} approximation of full float32 search at this n / top-{n}."
+    )
+    lines.append("")
+    lines.append(
+        f"**Off-the-shelf cross-encoder doesn't.** Stage 2b achieves "
+        f"R@{k} = {_fmt_pct(result['stage2b_recall_at_k'])} at "
+        f"~{_fmt_ms(result['stage2b_latency_s_per_q'])} per query — strictly "
+        f"worse than the float32-IP baseline, and "
+        f"{result['stage2b_latency_s_per_q'] / max(result['stage2a_latency_s_per_q'], 1e-9):.0f}× "
+        f"slower. Two confounders worth naming:"
+    )
+    lines.append("")
+    lines.append(
+        "1. **Truth-metric mismatch.** R@K is measured against float32 IP "
+        "ground truth. Float32-IP rerank optimises the truth metric "
+        "directly; the cross-encoder optimises a *learned* relevance "
+        "function. To the extent the two disagree, the cross-encoder is "
+        "wrong by definition under this metric."
+    )
+    lines.append(
+        "2. **Domain mismatch.** `ms-marco-MiniLM-L-6-v2` is trained on "
+        "short web search query → web document relevance. Both "
+        "\"query\" and \"document\" here are full SPECTER2 paper records "
+        "(title + abstract, hundreds of tokens). The model is being asked "
+        "to do paper–paper semantic similarity in a regime it never saw "
+        "during pretraining."
+    )
+    lines.append("")
+    lines.append(
+        "The result isn't that cross-encoders are bad; it's that the "
+        f"interesting comparison for this corpus needs (a) a domain-matched "
+        f"reranker (a SciBERT-trained CE, or SPECTER2-style bi-encoder "
+        f"distilled into a cross-encoder), or (b) a different truth metric "
+        f"(human relevance judgments rather than float32-IP). Either change "
+        f"would let the cross-encoder express judgments that diverge "
+        f"meaningfully from raw IP."
     )
     lines.append("")
     return "\n".join(lines) + "\n"

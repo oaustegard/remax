@@ -228,6 +228,24 @@ def test_format_rerank_md_includes_latency_in_ms():
     assert "50.0 ms" in md  # 5e-2 s
 
 
+def test_format_rerank_md_labels_ceiling_as_stage2a():
+    """The R@K stage-2 ceiling equals stage-2a's R@K (float32-IP rerank
+    is optimal under the float32-IP truth metric). The markdown must say
+    so — the previous wording mislabelled R@top_n as the ceiling."""
+    md = format_rerank_md(result=_fake_result(), dataset="SPECTER2", seed=42)
+    assert "Stage-2 R@10 ceiling" in md
+    assert "stage 2a" in md
+    # And R@top_n is reported separately, not as the ceiling
+    assert "candidate-set retention" in md
+
+
+def test_format_rerank_md_includes_discussion():
+    md = format_rerank_md(result=_fake_result(), dataset="SPECTER2", seed=42)
+    assert "Discussion" in md
+    # Speedup ratio between the two stage-2 latencies must appear
+    assert "500" in md  # 5e-2 / 1e-4 = 500x
+
+
 # --------------------------------------------------------------------- #
 # CLI guardrails
 # --------------------------------------------------------------------- #
