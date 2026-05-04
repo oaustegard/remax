@@ -3,6 +3,10 @@
 The orchestrator is exercised end-to-end on a small synthetic corpus with a
 fake cross-encoder so the suite stays offline. A real-model integration
 test is gated on ``onnxruntime`` import availability.
+
+Multi-cross-encoder shape (PR #22 follow-up): the orchestrator accepts a
+list of rerankers and emits one stage-2b row per model. These tests cover
+both the legacy single-CE form and the new multi-CE form.
 """
 
 from __future__ import annotations
@@ -57,13 +61,26 @@ class _OracleReranker:
 class _ConstantReranker:
     """Fake reranker that returns the candidate set unchanged."""
 
-    model_id = "fake-constant"
+    def __init__(self, model_id: str = "fake-constant"):
+        self.model_id = model_id
 
     def prepare(self):
         return self
 
     def rerank(self, *, query_text, candidate_idx, candidate_texts, k):
         return candidate_idx[:k]
+
+
+class _ReverseReranker:
+    """Fake reranker that returns the candidate set reversed."""
+
+    model_id = "fake-reverse"
+
+    def prepare(self):
+        return self
+
+    def rerank(self, *, query_text, candidate_idx, candidate_texts, k):
+        return candidate_idx[::-1][:k]
 
 
 # --------------------------------------------------------------------- #
@@ -93,9 +110,8 @@ def test_orchestrator_returns_expected_keys():
     expected = {
         "n_corpus", "n_queries", "d", "top_n", "k_eval",
         "stage1_recall_at_k", "stage1_recall_at_topn",
-        "stage2a_recall_at_k", "stage2b_recall_at_k",
-        "stage2a_latency_s_per_q", "stage2b_latency_s_per_q",
-        "cross_encoder_model",
+        "stage2a_recall_at_k", "stage2a_latency_s_per_q",
+        "stage2b_results",
     }
     assert expected.issubset(res.keys())
     assert res["n_corpus"] == X.shape[0] - 10
@@ -103,7 +119,50 @@ def test_orchestrator_returns_expected_keys():
     assert res["d"] == X.shape[1]
     assert res["top_n"] == 20
     assert res["k_eval"] == 5
-    assert res["cross_encoder_model"] == "fake-constant"
+    assert isinstance(res["stage2b_results"], list)
+    assert len(res["stage2b_results"]) == 1
+    row = res["stage2b_results"][0]
+    assert row["model_id"] == "fake-constant"
+    assert {"recall_at_k", "latency_s_per_q"}.issubset(row.keys())
+
+
+def test_orchestrator_accepts_multiple_cross_encoders():
+    """The PR #22 follow-up shape: pass cross_encoders=[a, b, c] and get
+    one stage-2b row per model in the result."""
+    X, texts = _synthetic_corpus(n=200, d=64)
+    ces = [
+        _ConstantReranker(model_id="ce-a"),
+        _ConstantReranker(model_id="ce-b"),
+        _ReverseReranker(),
+    ]
+    res = run_rerank_experiment(
+        emb=X, texts=texts, n_queries=10, top_n=20, k_eval=5, seed=0,
+        cross_encoders=ces,
+    )
+    rows = res["stage2b_results"]
+    assert [r["model_id"] for r in rows] == ["ce-a", "ce-b", "fake-reverse"]
+    # Both constant rerankers should give the same recall (they produce
+    # identical orderings); the reverse reranker may differ.
+    assert rows[0]["recall_at_k"] == pytest.approx(rows[1]["recall_at_k"])
+
+
+def test_orchestrator_rejects_both_singular_and_plural():
+    X, texts = _synthetic_corpus(n=50, d=64)
+    with pytest.raises(ValueError, match="not both"):
+        run_rerank_experiment(
+            emb=X, texts=texts, n_queries=5, top_n=10, k_eval=5, seed=0,
+            cross_encoder=_ConstantReranker(),
+            cross_encoders=[_ConstantReranker()],
+        )
+
+
+def test_orchestrator_rejects_empty_cross_encoders():
+    X, texts = _synthetic_corpus(n=50, d=64)
+    with pytest.raises(ValueError, match="at least one"):
+        run_rerank_experiment(
+            emb=X, texts=texts, n_queries=5, top_n=10, k_eval=5, seed=0,
+            cross_encoders=[],
+        )
 
 
 def test_oracle_reranker_hits_the_candidate_ceiling():
@@ -124,12 +183,13 @@ def test_oracle_reranker_hits_the_candidate_ceiling():
         emb=X, texts=texts, n_queries=n_queries,
         top_n=50, k_eval=10, seed=42, cross_encoder=ce,
     )
+    oracle_row = res["stage2b_results"][0]
 
     # Float32-IP rerank is mathematically equivalent to the oracle for the
     # ranking metric used here (both order candidates by descending IP). So
     # 2a and 2b should match exactly.
     assert res["stage2a_recall_at_k"] == pytest.approx(
-        res["stage2b_recall_at_k"]
+        oracle_row["recall_at_k"]
     )
     # And stage 2 cannot fall below stage 1 R@K when the reranker is at
     # least as good as the stage-1 ranking — the oracle/float32 rerank
@@ -145,7 +205,7 @@ def test_constant_reranker_preserves_stage1_recall_at_k():
         emb=X, texts=texts, n_queries=10, top_n=30, k_eval=10, seed=0,
         cross_encoder=_ConstantReranker(),
     )
-    assert res["stage2b_recall_at_k"] == pytest.approx(
+    assert res["stage2b_results"][0]["recall_at_k"] == pytest.approx(
         res["stage1_recall_at_k"]
     )
 
@@ -186,8 +246,9 @@ def test_latency_fields_are_finite_and_positive():
     )
     assert np.isfinite(res["stage2a_latency_s_per_q"])
     assert res["stage2a_latency_s_per_q"] >= 0.0
-    assert np.isfinite(res["stage2b_latency_s_per_q"])
-    assert res["stage2b_latency_s_per_q"] >= 0.0
+    for row in res["stage2b_results"]:
+        assert np.isfinite(row["latency_s_per_q"])
+        assert row["latency_s_per_q"] >= 0.0
 
 
 # --------------------------------------------------------------------- #
@@ -195,7 +256,13 @@ def test_latency_fields_are_finite_and_positive():
 # --------------------------------------------------------------------- #
 
 
-def _fake_result():
+def _fake_result(stage2b_results=None):
+    if stage2b_results is None:
+        stage2b_results = [{
+            "model_id": "ce/test",
+            "recall_at_k": 0.75,
+            "latency_s_per_q": 0.05,
+        }]
     return {
         "n_corpus": 9900,
         "n_queries": 100,
@@ -205,10 +272,8 @@ def _fake_result():
         "stage1_recall_at_k": 0.5,
         "stage1_recall_at_topn": 0.85,
         "stage2a_recall_at_k": 0.7,
-        "stage2b_recall_at_k": 0.75,
         "stage2a_latency_s_per_q": 0.0001,
-        "stage2b_latency_s_per_q": 0.05,
-        "cross_encoder_model": "ce/test",
+        "stage2b_results": stage2b_results,
     }
 
 
@@ -219,7 +284,7 @@ def test_format_rerank_md_includes_all_recall_numbers():
     assert "0.700" in md   # stage2a
     assert "0.750" in md   # stage2b
     assert "SPECTER2" in md
-    assert "ce/test" in md
+    assert "ce/test" in md or "test" in md  # short id is OK
 
 
 def test_format_rerank_md_includes_latency_in_ms():
@@ -244,6 +309,28 @@ def test_format_rerank_md_includes_discussion():
     assert "Discussion" in md
     # Speedup ratio between the two stage-2 latencies must appear
     assert "500" in md  # 5e-2 / 1e-4 = 500x
+
+
+def test_format_rerank_md_renders_one_row_per_cross_encoder():
+    """Multi-CE results: one stage-2b row per model in the table."""
+    rows = [
+        {"model_id": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+         "recall_at_k": 0.305, "latency_s_per_q": 5.0},
+        {"model_id": "cross-encoder/scibert-msmarco",
+         "recall_at_k": 0.65, "latency_s_per_q": 6.5},
+    ]
+    md = format_rerank_md(
+        result=_fake_result(stage2b_results=rows),
+        dataset="SPECTER2", seed=42,
+    )
+    # Both models must appear in the table
+    assert "ms-marco-MiniLM-L-6-v2" in md
+    assert "scibert-msmarco" in md
+    # And each recall number is present
+    assert "0.305" in md
+    assert "0.650" in md
+    # Multi-CE narrative paragraph mentions the comparison
+    assert "domain-matched" in md.lower()
 
 
 # --------------------------------------------------------------------- #
@@ -284,7 +371,8 @@ def test_main_runs_end_to_end_with_fake_cross_encoder(
     # Replace CrossEncoderReranker with the constant fake so the CLI's
     # construction path doesn't try to download a real model.
     monkeypatch.setattr(
-        run_rerank, "CrossEncoderReranker", lambda **kw: _ConstantReranker()
+        run_rerank, "CrossEncoderReranker",
+        lambda **kw: _ConstantReranker(model_id=kw.get("model_id", "fake")),
     )
 
     out_path = tmp_path / "RERANK.md"
@@ -299,3 +387,39 @@ def test_main_runs_end_to_end_with_fake_cross_encoder(
     assert "SPECTER2" in text
     assert "stage 2a" in text
     assert "stage 2b" in text
+
+
+def test_main_accepts_multiple_cross_encoder_models(
+    monkeypatch, tmp_path
+):
+    """``--cross-encoder-model`` can be passed repeatedly; one stage-2b row
+    per model lands in the markdown."""
+    monkeypatch.setattr(datasets, "_CACHE_ROOT", tmp_path)
+    rng = np.random.default_rng(0)
+    n, d = 200, 768
+    emb = rng.standard_normal((n, d)).astype(np.float32)
+    texts = [f"doc-{i}" for i in range(n)]
+    emb_path = datasets.dataset_path("SPECTER2")
+    txt_path = datasets.texts_path("SPECTER2")
+    emb_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(emb_path, emb)
+    txt_path.write_text(json.dumps(texts), encoding="utf-8")
+
+    monkeypatch.setattr(
+        run_rerank, "CrossEncoderReranker",
+        lambda **kw: _ConstantReranker(model_id=kw["model_id"]),
+    )
+
+    out_path = tmp_path / "RERANK.md"
+    rc = run_rerank.main([
+        "--dataset", "SPECTER2", "--n", str(n),
+        "--queries", "10", "--top-n", "20",
+        "--cross-encoder-model", "org/model-a",
+        "--cross-encoder-model", "org/model-b",
+        "--out", str(out_path),
+    ])
+    assert rc == 0
+    text = out_path.read_text()
+    # Short-form ids appear in the table
+    assert "model-a" in text
+    assert "model-b" in text

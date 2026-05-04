@@ -22,6 +22,9 @@ bench/results/*
 !bench/results/crossover.csv
 !bench/results/crossover.png
 !bench/results/RERANK.md
+!bench/results/RERANK_topn_sweep.md
+!bench/results/rerank_topn_sweep.csv
+!bench/results/rerank_topn_sweep.png
 
 # IDE
 .vscode/
