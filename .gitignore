@@ -18,6 +18,9 @@ bench/results/*
 !bench/results/BASELINE.md
 !bench/results/SKETCH_MATRYOSHKA.md
 !bench/results/SKETCH_MATRYOSHKA_GEMINI.md
+!bench/results/CROSSOVER.md
+!bench/results/crossover.csv
+!bench/results/crossover.png
 
 # IDE
 .vscode/

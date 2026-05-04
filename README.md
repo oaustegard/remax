@@ -20,6 +20,8 @@ v0.0.0 — repo scaffolded, work tracked in [issues](https://github.com/oaustega
 
 **Baseline numbers**: [`bench/results/BASELINE.md`](bench/results/BASELINE.md). Reproduce with `bash bench/fetch_specter2_cache.sh && python bench/run_baseline.py`. The harness ports the structure of `remex/bench/` and runs the v0.1.0 quantizer ladder (1-bit + stacked k=2,4,8) against R@10 vs float32 ground truth.
 
+**Crossover plot vs remex**: [`bench/results/CROSSOVER.md`](bench/results/CROSSOVER.md). Reproduce with `python bench/crossover.py`. Side-by-side R@10 of remax stacked SimHash vs remex Lloyd-Max (Matryoshka extraction) at matched bits-per-dim — the publishable artifact for the rank-correct precision ladder claim.
+
 ## Relationship to remex
 
 [remex](https://github.com/oaustegard/remex) is the multi-precision Lloyd-Max + Matryoshka library it shares lineage with. remex is a Swiss Army knife optimized for storage MSE, with rank-correct 1-bit *as a free MSB extraction*. remax is a chisel optimized for rank, exclusively.

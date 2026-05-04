@@ -1,0 +1,13 @@
+dataset,bits_per_dim,method,R_at_10
+SPECTER2,1,remax_stacked,0.635000
+SPECTER2,2,remax_stacked,0.676000
+SPECTER2,3,remax_stacked,0.692000
+SPECTER2,4,remax_stacked,0.706000
+SPECTER2,6,remax_stacked,0.720000
+SPECTER2,8,remax_stacked,0.718000
+SPECTER2,1,remex_lloyd_max,0.607000
+SPECTER2,2,remex_lloyd_max,0.364000
+SPECTER2,3,remex_lloyd_max,0.589000
+SPECTER2,4,remex_lloyd_max,0.764000
+SPECTER2,6,remex_lloyd_max,0.927000
+SPECTER2,8,remex_lloyd_max,0.975000
