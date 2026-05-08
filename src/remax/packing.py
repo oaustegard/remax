@@ -23,6 +23,7 @@ __all__ = [
     "encode_signs",
     "hamming_distances",
     "hamming_search",
+    "stable_top_k",
 ]
 
 # 256-entry byte-popcount lookup. uint16 is plenty (max value 8 per byte).
@@ -100,6 +101,49 @@ def hamming_distances(
     return POPCOUNT_LUT[xor].sum(axis=1, dtype=np.int64)
 
 
+def stable_top_k(dists: np.ndarray, k: int) -> np.ndarray:
+    """Indices of the ``k`` smallest distances, stably tie-broken by index.
+
+    Equivalent to ``np.argsort(dists, kind="stable")[:k]`` but avoids the
+    full O(n log n) sort when ``k`` ≪ ``n``: an :func:`numpy.argpartition`
+    selects a candidate set, which is then widened to include all indices
+    whose distance equals the kth-smallest value, and the candidate set is
+    stably sorted.
+
+    Why the widening: ``argpartition`` is unstable. When several distances
+    tie at the kth value, it may keep a higher-indexed element inside the
+    top-k partition and exclude a lower-indexed element with the same
+    distance. Sorting only inside the partition cannot recover the
+    lower-indexed element. Widening to ``dists <= pivot`` brings every
+    tied candidate back into scope so the final stable sort matches
+    ``argsort(dists, kind="stable")[:k]`` byte-for-byte.
+
+    Parameters
+    ----------
+    dists : np.ndarray, shape (n,)
+        Per-row distances. Any totally-ordered numeric dtype.
+    k : int
+        Number of indices to return. Must be positive; the result is
+        clamped to ``min(k, n)``.
+
+    Returns
+    -------
+    order : np.ndarray, shape (min(k, n),), dtype intp
+        Indices into ``dists`` in ascending distance order, ties broken
+        by ascending index.
+    """
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
+    n = dists.shape[0]
+    k_eff = min(k, n)
+    if k_eff == n:
+        return np.argsort(dists, kind="stable")[:k_eff]
+    part = np.argpartition(dists, k_eff - 1)
+    pivot = dists[part[k_eff - 1]]
+    cand = np.flatnonzero(dists <= pivot)  # ascending order = stable for ties
+    return cand[np.argsort(dists[cand], kind="stable")][:k_eff]
+
+
 def hamming_search(
     query_rotated: np.ndarray,
     codes: np.ndarray,
@@ -133,13 +177,7 @@ def hamming_search(
     if q_code.ndim != 1:
         raise ValueError("query_rotated must be a single 1-D vector")
     dists = hamming_distances(codes, q_code)
-    n = dists.shape[0]
-    k_eff = min(k, n)
-    if k_eff == n:
-        order = np.argsort(dists, kind="stable")[:k_eff]
-    else:
-        part = np.argpartition(dists, k_eff)[:k_eff]
-        order = part[np.argsort(dists[part], kind="stable")]
+    order = stable_top_k(dists, k)
     if return_distances:
         return order, dists[order]
     return order

@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .packing import POPCOUNT_LUT, hamming_distances
+from .packing import POPCOUNT_LUT, hamming_distances, stable_top_k
 from .rotation import haar_rotation
 
 __all__ = ["StackedSignBitQuantizer"]
@@ -282,11 +282,7 @@ class StackedSignBitQuantizer:
         # the column count changes. SIMD popcount is post-v0.1.0.
         for i in range(m):
             dists = hamming_distances(codes, q_codes[i])
-            if k_eff == n:
-                order = np.argsort(dists, kind="stable")
-            else:
-                part = np.argpartition(dists, k_eff)[:k_eff]
-                order = part[np.argsort(dists[part], kind="stable")]
+            order = stable_top_k(dists, k_eff)
             out_idx[i] = order
             out_dist[i] = dists[order]
 
