@@ -89,8 +89,11 @@ def test_each_stacked_rotation_is_orthogonal():
     """Every per-stack Haar rotation must be exactly orthogonal."""
     q = StackedSignBitQuantizer(d=64, k=8, seed=7)
     eye = np.eye(64)
+    atol = 8 * np.sqrt(64) * np.finfo(q.rotations_.dtype).eps
     for j in range(8):
-        np.testing.assert_allclose(q.rotations_[j] @ q.rotations_[j].T, eye, atol=1e-6)
+        np.testing.assert_allclose(
+            q.rotations_[j] @ q.rotations_[j].T, eye, atol=atol
+        )
 
 
 # --------------------------------------------------------------------- #

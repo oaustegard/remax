@@ -50,7 +50,16 @@ class SignBitQuantizer:
     d : int
         Input dimension. Must be divisible by 8 (codes are packed bytewise).
     seed : int | None, default=None
-        RNG seed for the Haar rotation. Same seed → byte-identical codes.
+        RNG seed for the Haar rotation. Same seed + same ``dtype`` →
+        byte-identical codes.
+    dtype : numpy dtype, default=np.float32
+        Working precision for the rotation matrix and the matmul. The
+        output is always 1 bit per dimension, so f64 precision in the
+        rotation is wasted bandwidth — f32 halves memory traffic for the
+        encode matmul (sgemm vs dgemm) on every BLAS, and on Apple
+        silicon enables Accelerate's f32 path. Pass ``np.float64`` for
+        bit-exact compatibility with corpora encoded before this default
+        changed; recall is statistically identical either way.
 
     Attributes
     ----------
@@ -58,7 +67,9 @@ class SignBitQuantizer:
         Input dimension.
     seed : int | None
         RNG seed used for the rotation.
-    rotation_ : np.ndarray, shape (d, d), dtype float64
+    dtype : numpy dtype
+        Working precision (matches ``rotation_.dtype``).
+    rotation_ : np.ndarray, shape (d, d)
         Orthogonal rotation matrix. Established at construction time;
         ``fit`` is a no-op kept for sklearn-style ergonomics.
     n_bits : int
@@ -77,7 +88,13 @@ class SignBitQuantizer:
     True
     """
 
-    def __init__(self, d: int, seed: int | None = None):
+    def __init__(
+        self,
+        d: int,
+        seed: int | None = None,
+        *,
+        dtype: np.dtype | type = np.float32,
+    ):
         if not isinstance(d, (int, np.integer)) or d <= 0:
             raise ValueError(f"d must be a positive integer, got {d!r}")
         if d % 8 != 0:
@@ -87,7 +104,10 @@ class SignBitQuantizer:
             )
         self.d: int = int(d)
         self.seed: int | None = seed
-        self.rotation_: np.ndarray = haar_rotation(self.d, seed=seed)
+        self.dtype: np.dtype = np.dtype(dtype)
+        self.rotation_: np.ndarray = haar_rotation(
+            self.d, seed=seed, dtype=self.dtype
+        )
         self.n_bits: int = self.d
 
     # ------------------------------------------------------------------ #
@@ -114,7 +134,7 @@ class SignBitQuantizer:
         Accepts a 1-D vector ``(d,)`` as a single-row batch; in that case
         the returned shape is ``(d // 8,)``.
         """
-        X = np.asarray(X, dtype=np.float64)
+        X = np.asarray(X, dtype=self.dtype)
         squeezed = False
         if X.ndim == 1:
             X = X[None, :]
@@ -162,7 +182,7 @@ class SignBitQuantizer:
         """
         if k <= 0:
             raise ValueError(f"k must be positive, got {k}")
-        query = np.asarray(query, dtype=np.float64)
+        query = np.asarray(query, dtype=self.dtype)
         squeezed = False
         if query.ndim == 1:
             query = query[None, :]
