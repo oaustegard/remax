@@ -291,3 +291,96 @@ def test_fit_returns_self():
     q = SignBitQuantizer(d=16, seed=0)
     assert q.fit() is q
     assert q.fit(np.zeros((3, 16))) is q
+
+
+# --------------------------------------------------------------------- #
+# stable_top_k — tie-break stability
+# --------------------------------------------------------------------- #
+from remax.packing import stable_top_k
+
+
+def test_stable_top_k_matches_full_argsort_no_ties():
+    """Smoke: with all-distinct distances, stable_top_k matches argsort."""
+    rng = np.random.default_rng(0)
+    dists = rng.permutation(1000).astype(np.int64)  # all distinct
+    for k in (1, 5, 10, 100, 999, 1000, 1500):
+        got = stable_top_k(dists, k)
+        want = np.argsort(dists, kind="stable")[: min(k, dists.size)]
+        np.testing.assert_array_equal(got, want)
+
+
+def test_stable_top_k_breaks_ties_by_ascending_index():
+    """Equal distances must be returned in ascending index order."""
+    # Five elements all at distance 0, then one tied with the last at dist 1.
+    dists = np.array([0, 0, 0, 0, 0, 1], dtype=np.int64)
+    got = stable_top_k(dists, 5)
+    np.testing.assert_array_equal(got, [0, 1, 2, 3, 4])
+    # Top-3 from a long string of zeros must take the first three.
+    dists = np.zeros(50, dtype=np.int64)
+    got = stable_top_k(dists, 3)
+    np.testing.assert_array_equal(got, [0, 1, 2])
+
+
+def test_stable_top_k_handles_kth_boundary_ties():
+    """Regression for the argpartition-instability bug.
+
+    Construct a case where argpartition with k=4 may swap two indices
+    that share the kth-smallest distance. ``stable_top_k`` must always
+    pick the lower-indexed one, matching ``argsort(stable)[:k]``.
+    """
+    # Sorted ascending: [1, 2, 3, 4, 5, 5, 6, 7, 8, 9].
+    # The kth-smallest at k=5 is 5, shared by indices 2 and 7.
+    # Naive argpartition can put either one inside the partition.
+    # stable_top_k must always pick index 2 (the lower-indexed one).
+    dists = np.array([1, 2, 5, 3, 4, 9, 8, 5, 7, 6], dtype=np.int64)
+    want = np.argsort(dists, kind="stable")[:5]
+    got = stable_top_k(dists, 5)
+    np.testing.assert_array_equal(got, want)
+    assert 2 in got and 7 not in got
+
+
+def test_stable_top_k_random_stress_matches_argsort():
+    """Across many random distance vectors with forced ties, the helper
+    must agree with the slow O(n log n) reference."""
+    rng = np.random.default_rng(2026)
+    for trial in range(50):
+        n = int(rng.integers(20, 500))
+        # Small range forces lots of ties.
+        dists = rng.integers(0, 8, size=n).astype(np.int64)
+        for k in (1, 3, n // 4, n // 2, n - 1, n):
+            if k <= 0:
+                continue
+            got = stable_top_k(dists, k)
+            want = np.argsort(dists, kind="stable")[: min(k, n)]
+            np.testing.assert_array_equal(got, want)
+
+
+def test_stable_top_k_rejects_nonpositive_k():
+    with pytest.raises(ValueError, match="positive"):
+        stable_top_k(np.array([1, 2, 3]), 0)
+    with pytest.raises(ValueError, match="positive"):
+        stable_top_k(np.array([1, 2, 3]), -1)
+
+
+def test_search_class_matches_full_argsort_with_ties():
+    """SignBitQuantizer.search must match argsort(stable) when distances tie.
+
+    Pre-fix: the class used argpartition + partial sort, which broke
+    stability at the kth boundary. This test exercises the same shape as
+    the previously-failing test_search_class_matches_manual_hamming in
+    test_stacked.py.
+    """
+    rng = np.random.default_rng(13)
+    n, d = 200, 128
+    X = rng.standard_normal((n, d))
+    q = SignBitQuantizer(d=d, seed=13)
+    codes = q.encode(X)
+
+    qcode = q.encode(X[7])
+    xor = np.bitwise_xor(codes, qcode[None, :])
+    from remax.packing import POPCOUNT_LUT
+
+    manual_dists = POPCOUNT_LUT[xor].sum(axis=1, dtype=np.int64)
+    manual_top10 = np.argsort(manual_dists, kind="stable")[:10]
+    cls_top10 = q.search(X[7], codes, k=10)
+    np.testing.assert_array_equal(manual_top10, cls_top10)

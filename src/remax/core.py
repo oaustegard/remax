@@ -30,7 +30,12 @@ import numpy as np
 
 # Re-export the functional API at this layer so callers can import either
 # ``from remax.core import haar_rotation`` or ``from remax import haar_rotation``.
-from .packing import encode_signs, hamming_distances, hamming_search
+from .packing import (
+    encode_signs,
+    hamming_distances,
+    hamming_search,
+    stable_top_k,
+)
 from .rotation import haar_rotation
 
 __all__ = [
@@ -194,11 +199,7 @@ class SignBitQuantizer:
         # is explicitly post-v0.1.0).
         for i in range(m):
             dists = hamming_distances(codes, q_codes[i])
-            if k_eff == n:
-                order = np.argsort(dists, kind="stable")
-            else:
-                part = np.argpartition(dists, k_eff)[:k_eff]
-                order = part[np.argsort(dists[part], kind="stable")]
+            order = stable_top_k(dists, k_eff)
             out_idx[i] = order
             out_dist[i] = dists[order]
 
