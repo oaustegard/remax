@@ -25,7 +25,11 @@ import numpy as np
 __all__ = ["haar_rotation"]
 
 
-def haar_rotation(d: int, seed: int | None = None) -> np.ndarray:
+def haar_rotation(
+    d: int,
+    seed: int | None = None,
+    dtype: np.dtype | type = np.float32,
+) -> np.ndarray:
     """Generate a Haar-distributed random orthogonal matrix.
 
     Parameters
@@ -34,12 +38,20 @@ def haar_rotation(d: int, seed: int | None = None) -> np.ndarray:
         Matrix dimension. Must be a positive integer.
     seed : int | None, default=None
         RNG seed. Same seed → same matrix on the same machine.
+    dtype : numpy dtype, default=np.float32
+        Output dtype. The QR factorisation runs in float64 for numerical
+        stability (Mezzadri sign correction depends on the sign of
+        ``diag(R)``, which is sharp in f64 even for nearly-singular
+        diagonals); the result is then cast. f32 is the default because
+        SimHash only consumes the *sign* of ``X @ R``, so f64 precision in
+        the rotation matrix is wasted bandwidth — see ``packing.encode_signs``.
 
     Returns
     -------
-    R : np.ndarray, shape (d, d), dtype float64
+    R : np.ndarray, shape (d, d), dtype matches ``dtype``
         Orthogonal rotation matrix. ``R @ R.T`` is the identity to within
-        floating-point round-off.
+        floating-point round-off (looser at f32: ``atol≈1e-5`` instead of
+        ``≈1e-12``).
 
     References
     ----------
@@ -58,4 +70,4 @@ def haar_rotation(d: int, seed: int | None = None) -> np.ndarray:
     signs = np.sign(np.diag(R))
     signs[signs == 0.0] = 1.0
     Q = Q * signs  # broadcasts over columns
-    return Q
+    return Q.astype(dtype, copy=False)
