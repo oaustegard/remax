@@ -69,6 +69,13 @@ class StackedSignBitQuantizer:
         :class:`numpy.random.SeedSequence` so the ``k`` rotations are
         statistically independent while the full ensemble is reproducible
         from ``(d, k, seed)``.
+    dtype : numpy dtype, default=np.float32
+        Working precision for the rotations and the encode matmul.
+        See :class:`~remax.SignBitQuantizer` for the rationale; the
+        intermediate (``k`` × ``n`` × ``d``) array dominates memory at
+        large ``k``, so the f32 default also halves stacked-encode peak
+        RSS. Pass ``np.float64`` for bit-exact compatibility with corpora
+        encoded before this default changed.
 
     Attributes
     ----------
@@ -78,9 +85,11 @@ class StackedSignBitQuantizer:
         Number of stacked signatures.
     seed : int | None
         Master seed.
+    dtype : numpy dtype
+        Working precision (matches ``rotations_.dtype``).
     n_bits : int
         Total bits per code, ``k * d``.
-    rotations_ : np.ndarray, shape (k, d, d), dtype float64
+    rotations_ : np.ndarray, shape (k, d, d)
         Stack of ``k`` independent Haar rotation matrices.
 
     Examples
@@ -104,7 +113,14 @@ class StackedSignBitQuantizer:
     programming." *J. ACM*.
     """
 
-    def __init__(self, d: int, k: int, seed: int | None = None):
+    def __init__(
+        self,
+        d: int,
+        k: int,
+        seed: int | None = None,
+        *,
+        dtype: np.dtype | type = np.float32,
+    ):
         if not isinstance(d, (int, np.integer)) or d <= 0:
             raise ValueError(f"d must be a positive integer, got {d!r}")
         if d % 8 != 0:
@@ -117,6 +133,7 @@ class StackedSignBitQuantizer:
         self.d: int = int(d)
         self.k: int = int(k)
         self.seed: int | None = seed
+        self.dtype: np.dtype = np.dtype(dtype)
         self.n_bits: int = self.k * self.d
 
         # Spawn k independent uint32 seeds from the master via SeedSequence.
@@ -126,9 +143,11 @@ class StackedSignBitQuantizer:
         ss = np.random.SeedSequence(seed)
         child_states = ss.generate_state(self.k, dtype=np.uint32)
 
-        rotations = np.empty((self.k, self.d, self.d), dtype=np.float64)
+        rotations = np.empty((self.k, self.d, self.d), dtype=self.dtype)
         for j in range(self.k):
-            rotations[j] = haar_rotation(self.d, seed=int(child_states[j]))
+            rotations[j] = haar_rotation(
+                self.d, seed=int(child_states[j]), dtype=self.dtype
+            )
         self.rotations_: np.ndarray = rotations
 
     # ------------------------------------------------------------------ #
@@ -161,7 +180,7 @@ class StackedSignBitQuantizer:
         of row ``i`` are the SimHash code under rotation 0, the next
         ``d // 8`` are under rotation 1, and so on.
         """
-        X = np.asarray(X, dtype=np.float64)
+        X = np.asarray(X, dtype=self.dtype)
         squeezed = False
         if X.ndim == 1:
             X = X[None, :]
@@ -231,7 +250,7 @@ class StackedSignBitQuantizer:
         """
         if k <= 0:
             raise ValueError(f"k must be positive, got {k}")
-        query = np.asarray(query, dtype=np.float64)
+        query = np.asarray(query, dtype=self.dtype)
         squeezed = False
         if query.ndim == 1:
             query = query[None, :]

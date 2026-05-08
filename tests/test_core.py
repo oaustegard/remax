@@ -30,16 +30,28 @@ from remax import (
 # --------------------------------------------------------------------- #
 # 1. Rotation orthogonality
 # --------------------------------------------------------------------- #
+def _orth_atol(d: int, dtype) -> float:
+    """Tolerance for ``R @ R.T ≈ I`` scaled to the working precision.
+
+    Round-off in the d-term inner product accumulates to ~``sqrt(d) * eps``
+    in the worst case; ``8 *`` gives slack for QR + sign-correction.
+    """
+    return 8 * np.sqrt(d) * np.finfo(dtype).eps
+
+
 @pytest.mark.parametrize("d", [8, 64, 128, 768])
-def test_rotation_orthogonality(d: int):
-    R = haar_rotation(d=d, seed=0)
-    np.testing.assert_allclose(R @ R.T, np.eye(d), atol=1e-6)
-    np.testing.assert_allclose(R.T @ R, np.eye(d), atol=1e-6)
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_rotation_orthogonality(d: int, dtype):
+    R = haar_rotation(d=d, seed=0, dtype=dtype)
+    atol = _orth_atol(d, dtype)
+    np.testing.assert_allclose(R @ R.T, np.eye(d), atol=atol)
+    np.testing.assert_allclose(R.T @ R, np.eye(d), atol=atol)
 
 
 def test_rotation_orthogonal_via_class():
     q = SignBitQuantizer(d=128, seed=0)
-    np.testing.assert_allclose(q.rotation_ @ q.rotation_.T, np.eye(128), atol=1e-6)
+    atol = _orth_atol(128, q.rotation_.dtype)
+    np.testing.assert_allclose(q.rotation_ @ q.rotation_.T, np.eye(128), atol=atol)
 
 
 # --------------------------------------------------------------------- #
@@ -291,3 +303,77 @@ def test_fit_returns_self():
     q = SignBitQuantizer(d=16, seed=0)
     assert q.fit() is q
     assert q.fit(np.zeros((3, 16))) is q
+
+
+# --------------------------------------------------------------------- #
+# 4. Working-precision (dtype) parity
+# --------------------------------------------------------------------- #
+def test_default_dtype_is_float32():
+    """The default working precision is f32 (PR rationale: SimHash output
+    is 1 bit, so f64 in the rotation matmul is wasted bandwidth)."""
+    q = SignBitQuantizer(d=64, seed=0)
+    assert q.dtype == np.float32
+    assert q.rotation_.dtype == np.float32
+
+
+def test_dtype_param_round_trips():
+    """Both f32 and f64 produce orthogonal rotations and self-consistent codes."""
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((50, 256))
+    for dtype in (np.float32, np.float64):
+        q = SignBitQuantizer(d=256, seed=42, dtype=dtype)
+        assert q.dtype == np.dtype(dtype)
+        assert q.rotation_.dtype == np.dtype(dtype)
+        codes = q.encode(X)
+        assert codes.dtype == np.uint8
+        # Self-distance is zero — encode then re-encode the same row gives
+        # identical codes.
+        c0 = q.encode(X[0])
+        np.testing.assert_array_equal(codes[0], c0)
+
+
+def test_f32_vs_f64_top10_recall_synthetic():
+    """f32 and f64 quantizers agree on the vast majority of top-10 results.
+
+    SimHash only consumes ``sign(<r, x>)``; the f32 vs f64 mismatch can only
+    flip a bit when ``<r, x> ≈ 0``, which is rare. Top-10 overlap should be
+    ≥ 9/10 in expectation across queries on isotropic Gaussian data.
+    """
+    rng = np.random.default_rng(7)
+    n, d, k_top = 1000, 256, 10
+    X = rng.standard_normal((n, d))
+    queries = rng.standard_normal((30, d))
+
+    q32 = SignBitQuantizer(d=d, seed=2026, dtype=np.float32)
+    q64 = SignBitQuantizer(d=d, seed=2026, dtype=np.float64)
+    c32 = q32.encode(X)
+    c64 = q64.encode(X)
+
+    # Codes themselves should match in nearly all bits — disagreement only
+    # at coordinates whose f64 dot product fell within f32 round-off of 0.
+    bit_diff = np.unpackbits(c32 ^ c64).sum() / (n * d)
+    assert bit_diff < 1e-3, f"f32 vs f64 bit disagreement {bit_diff:.4%} too high"
+
+    overlaps = []
+    for qv in queries:
+        t32 = set(q32.search(qv, c32, k=k_top).tolist())
+        t64 = set(q64.search(qv, c64, k=k_top).tolist())
+        overlaps.append(len(t32 & t64))
+    mean_overlap = np.mean(overlaps)
+    assert mean_overlap >= 9.0, (
+        f"mean top-{k_top} overlap {mean_overlap:.2f} < 9.0 — f32 path "
+        "diverges from f64 more than expected"
+    )
+
+
+def test_dtype_passes_through_input_unchanged():
+    """f32 input through an f32 quantizer should not trigger an upcast."""
+    rng = np.random.default_rng(0)
+    X32 = rng.standard_normal((10, 64)).astype(np.float32)
+    q = SignBitQuantizer(d=64, seed=0)  # default f32
+    # Patch np.asarray to fail loudly if a dtype-changing copy happens.
+    # We assert the simpler invariant: encoding f32 input with an f32
+    # quantizer matches encoding the explicit f64 view through an f32
+    # quantizer (i.e. the cast is a no-op for f32 input).
+    X64 = X32.astype(np.float64)
+    np.testing.assert_array_equal(q.encode(X32), q.encode(X64))

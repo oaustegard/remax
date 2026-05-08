@@ -162,7 +162,26 @@ def _meta_rows(
 class Corpus:
     """Paired bit-vector index + SQLite metadata store."""
 
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        dtype: np.dtype | type | None = None,
+    ):
+        """Open an existing corpus directory.
+
+        Parameters
+        ----------
+        path : str | Path
+            Directory containing ``index.bin`` and ``meta.db``.
+        dtype : numpy dtype, optional
+            Working precision for the reconstructed quantizer (used to
+            encode queries at search time). Defaults to the
+            :class:`SignBitQuantizer` default. Pass ``np.float64`` to
+            match queries against corpora that were built before the
+            f32-default change if you want bit-exact query encoding;
+            recall is statistically identical either way.
+        """
         self._dir = Path(path)
         bin_path = self._dir / _BIN_NAME
         db_path = self._dir / _DB_NAME
@@ -201,7 +220,10 @@ class Corpus:
 
         codes_flat = raw[payload_off : payload_off + codes_bytes]
         self._codes = codes_flat.reshape(n, d // 8)
-        self._quantizer = SignBitQuantizer(d=d, seed=seed)
+        q_kwargs: dict = {"d": d, "seed": seed}
+        if dtype is not None:
+            q_kwargs["dtype"] = dtype
+        self._quantizer = SignBitQuantizer(**q_kwargs)
         self._db_path = str(db_path)
 
         # Load corpus mean if persisted by build(center=True).
@@ -230,9 +252,15 @@ class Corpus:
         seed: int | None = None,
         meta: list[dict] | None = None,
         center: bool = False,
+        dtype: np.dtype | type | None = None,
     ) -> "Corpus":
-        """Build a corpus from raw vectors and record IDs."""
-        vectors = np.asarray(vectors, dtype=np.float64)
+        """Build a corpus from raw vectors and record IDs.
+
+        ``dtype`` controls the quantizer's working precision; ``None``
+        uses the :class:`SignBitQuantizer` default. Centering, when
+        enabled, is computed in the input dtype before encoding.
+        """
+        vectors = np.asarray(vectors)
         if vectors.ndim != 2:
             raise ValueError(f"vectors must be 2-D, got shape {vectors.shape}")
         n, inferred_d = vectors.shape
@@ -263,7 +291,10 @@ class Corpus:
         except OSError:
             pass
 
-        q = SignBitQuantizer(d=d, seed=seed)
+        q_kwargs: dict = {"d": d, "seed": seed}
+        if dtype is not None:
+            q_kwargs["dtype"] = dtype
+        q = SignBitQuantizer(**q_kwargs)
         if center:
             corpus_mean = vectors.mean(axis=0)
             enc_vectors = vectors - corpus_mean
@@ -283,9 +314,12 @@ class Corpus:
             pass
 
         # Persist the corpus mean so search() can auto-center queries.
+        # Mean is saved in input dtype so the round-trip is bit-exact for
+        # callers that built with f32; the centering subtract at search
+        # time is a single vector op, not a hot loop.
         mean_path = dest / _MEAN_NAME
         if corpus_mean is not None:
-            np.save(mean_path, corpus_mean.astype(np.float64))
+            np.save(mean_path, np.ascontiguousarray(corpus_mean))
             try:
                 os.chmod(mean_path, 0o600)
             except OSError:
@@ -328,7 +362,7 @@ class Corpus:
         if k <= 0:
             return []
 
-        query = np.asarray(query, dtype=np.float64)
+        query = np.asarray(query, dtype=self._quantizer.dtype)
         if self._mean is not None:
             query = query - self._mean
 
