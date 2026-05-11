@@ -78,6 +78,34 @@ The two coexist:
 - Use **remax** when you need a pure-rank in-memory tier with a precision ladder that doesn't break in the middle.
 - Use **both** if your two-stage retrieval architecture wants a remax-ladder Stage 1 and remex Stage 2.
 
+## Related work: training-time quantization-friendly embeddings
+
+Two training-time techniques converge on the property remax operates on at inference: *embeddings whose distribution shape makes 1-bit quantization rank-preserving*.
+
+**Matryoshka Representation Learning** ([Kusupati et al. 2022](https://arxiv.org/abs/2205.13147)) trains so any prefix of an embedding is a usable embedding. This gives a **dimension knob**: truncate to 256-d or 128-d and rank is largely preserved.
+
+**Global Orthogonal Regularizer (GOR)** ([Zhang et al. 2017](https://arxiv.org/abs/1708.06320), revived in [embeddinggemma](https://arxiv.org/abs/2509.20354) and [jina-embeddings-v5](https://arxiv.org/abs/2602.15547)) adds a contrastive term that penalizes squared cosine between non-matching pairs, pushing the distribution toward uniform-on-sphere. This gives a **precision knob**: binarize and rank is largely preserved.
+
+Jina v5's Table 6 quantifies the GOR effect at full dimension:
+
+| Configuration | MTEB BF16 | MTEB Binary  | RTEB BF16 | RTEB Binary  |
+|---------------|-----------|--------------|-----------|--------------|
+| With GOR      | 64.50     | 62.60 (−1.90) | 66.45    | 63.94 (−2.51) |
+| Without GOR   | 64.21     | 61.13 (−3.08) | 66.16    | 62.24 (−3.92) |
+
+GOR halves the binary-quantization loss at negligible BF16 cost (+0.29). The two knobs compound for in-memory first-pass retrieval — a 1024-d BF16 embedding (2 KB) becomes 32 bytes at 256-d binary (64× compression), with both operations independently rank-preserving.
+
+The jina-v5 paper presents each knob in isolation; it does not publish recall numbers for combined truncation + binarization — the actual first-pass configuration most self-hosters would deploy. The combined story (Matryoshka + GOR) is implicit in the architecture but undersold in the evaluation.
+
+### What this means for remax
+
+remax is encoder-agnostic — it consumes any numpy array of embeddings and exposes a **third rank-preserving knob**: a stacked-precision ladder that gives k bits per dimension with variance ∝ 1/k. The competitive frame depends on the embedding source:
+
+- **Already centered** (GOR-trained, or pre-normalized via other means): remax's corpus-mean centering is near-no-op. The stacked ladder remains orthogonal to both Matryoshka and GOR — pick a dimension via Matryoshka, pick a precision tier via the ladder. The ~2-point binary headroom that remains on GOR-trained models is the ladder's addressable problem.
+- **Not centered** (the common case for precomputed embedding corpora today, including the published SPECTER2 artifacts): corpus-mean centering does substantial work — the +0.324 R@100 measured on SPECTER2 is the upper end of what's recoverable — and the stacked ladder layers on top.
+
+SPECTER2 is remax's primary benchmark substrate because it's a large, publicly-available precomputed embedding corpus, not because remax targets SPECTER2 specifically. The library applies to any embedding source where the distribution shape leaves recall on the table.
+
 ## Background
 
 This library emerged from a series of experiments documented on [muninn.austegard.com](https://muninn.austegard.com):
