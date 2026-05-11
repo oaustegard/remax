@@ -59,6 +59,8 @@ of the remax retrieval stack (``hamming_distances``, ``hamming_search``,
 
 from __future__ import annotations
 
+from typing import Hashable, Iterable, Mapping
+
 import numpy as np
 
 try:
@@ -216,14 +218,8 @@ class SparseSignBitQuantizer:
             data_f = data.astype(np.float64, copy=False)
             contrib = self.sign_[indices] * data_f  # int8 * f64 → f64
             np.add.at(buf, (rows, cols), contrib)
-        if self.center:
-            if self.mean_buf_ is None:
-                raise RuntimeError(
-                    "center=True requires fit() before encode()"
-                )
-            buf -= self.mean_buf_[None, :]
-        bits = buf > 0
-        return np.packbits(bits, axis=-1)
+        self._apply_centering(buf)
+        return self._pack_signs(buf)
 
     def encode_query(self, q) -> np.ndarray:
         """Encode a single-row sparse matrix into a ``(k // 8,)`` code."""
@@ -234,6 +230,101 @@ class SparseSignBitQuantizer:
                 f"got shape {q.shape}"
             )
         return self.encode(q)[0]
+
+    def encode_from_postings(
+        self,
+        postings: Iterable[
+            tuple[Hashable, Iterable[tuple[Hashable, float]]]
+        ],
+        n: int,
+        doc_id_map: Mapping[Hashable, int] | None = None,
+    ) -> np.ndarray:
+        """Encode an inverted-index stream into ``(n, k // 8)`` uint8 codes.
+
+        Single-pass streaming construction over an inverted index — never
+        materializes the equivalent ``(n, d)`` CSR. Wraps around term
+        iterators from Elasticsearch / Lucene / FTS5 in production.
+
+        Parameters
+        ----------
+        postings : iterable of (term, doc_weights)
+            Iterator of ``(term, [(doc_id, weight), ...])`` pairs. ``term``
+            is the integer column index in ``[0, d)``. ``doc_weights``
+            may itself be a generator — it is consumed once.
+        n : int
+            Total number of documents (rows in the output).
+        doc_id_map : mapping, optional
+            ``{doc_id: row_index}`` for arbitrary hashable doc IDs. When
+            absent, doc IDs must be integers in ``[0, n)``. A doc ID not
+            present in the map raises :class:`KeyError`.
+
+        Returns
+        -------
+        codes : np.ndarray, shape (n, k // 8), dtype uint8
+            Byte-equal to :meth:`encode` on the equivalent CSR.
+
+        Notes
+        -----
+        Terms with empty postings are silently skipped. Term order does
+        not change the packed bytes (sums use float64 accumulators —
+        exact for integer weights; bit-stable for typical real weights
+        unless a bucket sum lands within ULPs of zero).
+        """
+        if not isinstance(n, (int, np.integer)) or n < 0:
+            raise ValueError(
+                f"n must be a non-negative integer, got {n!r}"
+            )
+        buf = np.zeros((int(n), self.k), dtype=np.float64)
+        for term, doc_weights in postings:
+            bucket, sign = self._hash_term(term)
+            rows_list: list[int] = []
+            weights_list: list[float] = []
+            for doc_id, weight in doc_weights:
+                row = (
+                    doc_id_map[doc_id] if doc_id_map is not None else doc_id
+                )
+                rows_list.append(int(row))
+                weights_list.append(float(weight))
+            if not rows_list:
+                continue
+            rows_arr = np.asarray(rows_list, dtype=np.int64)
+            weights_arr = np.asarray(weights_list, dtype=np.float64)
+            np.add.at(buf, (rows_arr, bucket), sign * weights_arr)
+        self._apply_centering(buf)
+        return self._pack_signs(buf)
+
+    # ------------------------------------------------------------------ #
+    # Shared private helpers (extracted in #35 for the postings path).
+    # ------------------------------------------------------------------ #
+    def _hash_term(self, term: Hashable) -> tuple[int, int]:
+        """Return ``(bucket, sign)`` for a single column-index term.
+
+        ``term`` must be an integer in ``[0, d)`` — the streaming API
+        treats terms as column indices into the same hash table that
+        :meth:`encode` indexes with ``X.indices``. Callers wrapping a
+        token-based inverted index are responsible for mapping tokens to
+        column indices via their own vocabulary.
+        """
+        j = int(term)
+        if j < 0 or j >= self.d:
+            raise IndexError(
+                f"term {term!r} maps to column {j}, out of range [0, {self.d})"
+            )
+        return int(self.bucket_[j]), int(self.sign_[j])
+
+    def _pack_signs(self, buf: np.ndarray) -> np.ndarray:
+        """Pack ``buf > 0`` into ``(..., k // 8)`` uint8 codes."""
+        return np.packbits(buf > 0, axis=-1)
+
+    def _apply_centering(self, buf: np.ndarray) -> None:
+        """In-place subtraction of the projected corpus mean when ``center=True``."""
+        if not self.center:
+            return
+        if self.mean_buf_ is None:
+            raise RuntimeError(
+                "center=True requires fit() before encode()"
+            )
+        buf -= self.mean_buf_[None, :]
 
     # ------------------------------------------------------------------ #
     def _validate(self, X):
