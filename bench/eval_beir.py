@@ -9,6 +9,11 @@ binary quantization on the MTEB Retrieval subset.
 
 Adapter: `retrieval` with prompt_name="query" for queries, "document" for corpus.
 
+To skip the ~80-minute CPU encode, fetch the precomputed cache first:
+
+    bash bench/fetch_jina_v5_scifact_cache.sh
+    python3 bench/eval_beir.py --eval-only
+
 Outputs:
     bench/.cache/JINA_V5_BEIR_SCIFACT/{corpus,queries}.npy  (cached embeddings)
     bench/results/JINA_V5_BEIR.md
