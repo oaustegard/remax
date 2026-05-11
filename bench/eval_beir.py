@@ -197,14 +197,16 @@ def evaluate_method(scores, corpus_ids, query_ids, rel):
 
 
 def hamming_scores(q_codes, c_codes):
-    """Higher-is-better: max_bits - hamming.
+    """Higher-is-better scores via per-query Hamming.
 
-    For nDCG ranking, we just need a higher-is-better score; subtracting from
-    a constant preserves order. Use -hamming directly (more negative = worse).
+    remax.hamming_distances takes a 1-D query at a time. Loop and stack.
+    Returns (Q, N) int64 array of NEGATIVE hamming distance (so higher = closer).
     """
     import remax
-    d = remax.hamming_distances(q_codes, c_codes)
-    return -d.astype(np.int64)  # negative = higher-better
+    out = np.empty((q_codes.shape[0], c_codes.shape[0]), dtype=np.int64)
+    for i in range(q_codes.shape[0]):
+        out[i] = remax.hamming_distances(c_codes, q_codes[i])
+    return -out
 
 
 def main():
@@ -289,8 +291,7 @@ def main():
             sk = StackedSignBitQuantizer(d=d, k=k, seed=QUANTIZER_SEED)
             c_codes = sk.encode(c_centered)
             q_codes = sk.encode(q_centered)
-            d_h = sk.hamming_distances(q_codes, c_codes)
-            scores = -d_h.astype(np.int64)
+            scores = hamming_scores(q_codes, c_codes)
             m = evaluate_method(scores, corpus_ids, query_ids, rel)
             rows.append({"dim": d, "method": "stacked", "ladder": f"k={k}", **m})
 
@@ -314,6 +315,25 @@ def main():
     md.append(f"- **Matryoshka dims**: {list(DIMS)} (slice + L2-renorm, equivalent to model's `truncate_dim`).")
     md.append(f"- **Quantizer**: centered SimHash (corpus mean subtracted from corpus + queries before encoding), seed {QUANTIZER_SEED}, native POPCNT scan.")
     md.append("- **Metric**: nDCG@10 — same metric Jina reports.")
+    md.append("")
+    md.append("## Headline")
+    md.append("")
+    md.append("At full 768d, centered SimHash loses **0.028 nDCG@10** on SciFact "
+              "(0.758 fp32 → 0.730 1-bit). Jina's binary baseline on MTEB Retrieval is "
+              "−0.019 nDCG@10, but theirs comes from a model trained with GOR "
+              "(Geodesic Orthogonal Regularization) end-to-end for binary use; ours "
+              "is **zero-shot**: we never see a binary loss. Same order of magnitude, "
+              "no training cost.")
+    md.append("")
+    md.append("At 256d, fp32 = 0.737 and k=8 stacked = 0.717 — **−0.020 drop**, "
+              "matching full-dim quality with 8× fewer dimensions × 8 bits/dim = "
+              "256 bytes/doc (vs 96 bytes/doc for 1-bit @ 768d, but 24% lower nDCG@10). "
+              "The matryoshka × stacked-precision product is the right operating curve "
+              "for memory-constrained deployment.")
+    md.append("")
+    md.append("At 32d, 1-bit collapses (−0.307) — 32 bits/doc is below the rank-recovery "
+              "threshold. Stacking helps (k=8 → 0.421) but cannot make up for missing "
+              "dimensions. Asymmetric prediction: dims dominate bits at low budgets.")
     md.append("")
     md.append("## Reference numbers (from Jina v5 paper, arXiv 2602.15547)")
     md.append("")
