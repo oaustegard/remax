@@ -5,6 +5,8 @@ Public surface (v0.1.0 in progress):
 * :class:`SignBitQuantizer` — 1-bit Charikar/SimHash core.
 * :class:`StackedSignBitQuantizer` — k-stack precision ladder
   (variance ∝ 1/k, every step rank-correct).
+* :class:`SparseSignBitQuantizer` — sparse → sign-packed count-sketch
+  encoder (BM25 / TF-IDF / SPLADE compatible).
 * Functional primitives: :func:`haar_rotation`, :func:`encode_signs`,
   :func:`hamming_distances`, :func:`hamming_search`.
 * :func:`characterize` — encoder characterization utility; sweeps a
@@ -20,6 +22,7 @@ from .core import (
     hamming_search,
 )
 from .corpus import Corpus, Result
+from .sparse import SparseSignBitQuantizer
 from .stacked import StackedSignBitQuantizer
 from ._native import AVAILABLE as NATIVE_AVAILABLE
 
@@ -28,6 +31,7 @@ __version__ = "0.0.0"
 __all__ = [
     "SignBitQuantizer",
     "StackedSignBitQuantizer",
+    "SparseSignBitQuantizer",
     "Corpus",
     "Result",
     "haar_rotation",
