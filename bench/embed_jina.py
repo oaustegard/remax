@@ -34,32 +34,61 @@ SRC = REPO_ROOT / "bench" / ".cache" / "SPECTER2" / "texts.json"
 DST_DIR = REPO_ROOT / "bench" / ".cache" / "JINA_V5_NANO"
 
 
-def encode_task(model, texts, task, batch_size, max_length):
-    out = np.empty((len(texts), DIM), dtype=np.float32)
+def encode_task(model, texts, task, batch_size, max_length, ckpt_dir):
+    """Encode `texts` under `task` with batch-level checkpointing.
+
+    Saves a numpy memmap at ckpt_dir/{task}.partial.npy and a sidecar
+    ckpt_dir/{task}.partial.json with {"done": <int>}. On resume, we mmap
+    the existing partial and skip the prefix already encoded.
+    """
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    partial = ckpt_dir / f"{task}.partial.npy"
+    sidecar = ckpt_dir / f"{task}.partial.json"
+
+    n = len(texts)
+    if partial.exists() and sidecar.exists():
+        info = json.loads(sidecar.read_text())
+        if info.get("n") == n and info.get("dim") == DIM:
+            out = np.lib.format.open_memmap(partial, mode="r+")
+            start = int(info.get("done", 0))
+            sys.stderr.write(f"  [{task}] resuming from {start}/{n}\n")
+        else:
+            sys.stderr.write(f"  [{task}] partial shape mismatch; restarting\n")
+            partial.unlink(missing_ok=True)
+            sidecar.unlink(missing_ok=True)
+            out = np.lib.format.open_memmap(partial, mode="w+", dtype=np.float32, shape=(n, DIM))
+            start = 0
+    else:
+        out = np.lib.format.open_memmap(partial, mode="w+", dtype=np.float32, shape=(n, DIM))
+        start = 0
+        sidecar.write_text(json.dumps({"n": n, "dim": DIM, "done": 0}))
+
     t0 = time.time()
     last_log = t0
-    for i in range(0, len(texts), batch_size):
+    last_flush_done = start
+    FLUSH_EVERY = 64  # texts (4 batches at B=16)
+    for i in range(start, n, batch_size):
         chunk = texts[i : i + batch_size]
         emb = model.encode(
-            texts=chunk,
-            task=task,
-            prompt_name="document",
-            max_length=max_length,
+            texts=chunk, task=task, prompt_name="document", max_length=max_length,
         )
         arr = emb.detach().cpu().float().numpy()
         out[i : i + len(chunk)] = arr
+        done = i + len(chunk)
+        if done - last_flush_done >= FLUSH_EVERY or done >= n:
+            out.flush()
+            sidecar.write_text(json.dumps({"n": n, "dim": DIM, "done": done}))
+            last_flush_done = done
         now = time.time()
-        if now - last_log > 30 or i + batch_size >= len(texts):
-            done = i + len(chunk)
-            rate = done / (now - t0)
-            eta = (len(texts) - done) / max(rate, 1e-9)
+        if now - last_log > 30 or done >= n:
+            rate = (done - start) / max(now - t0, 1e-9)
+            eta = (n - done) / max(rate, 1e-9)
             sys.stderr.write(
-                f"  [{task}] {done}/{len(texts)}  "
-                f"rate={rate:.2f}/s  eta={eta/60:.1f}min\n"
+                f"  [{task}] {done}/{n}  rate={rate:.2f}/s  eta={eta/60:.1f}min\n"
             )
             sys.stderr.flush()
             last_log = now
-    return out
+    return np.asarray(out)
 
 
 def main():
@@ -106,12 +135,15 @@ def main():
             sys.stderr.write(f"[redo] {task}: cached shape {arr.shape} != expected ({len(texts)}, {DIM})\n")
         sys.stderr.write(f"\n=== encoding task={task} ===\n")
         t0 = time.time()
-        emb = encode_task(model, texts, task, args.batch, args.max_len)
+        emb = encode_task(model, texts, task, args.batch, args.max_len, DST_DIR)
         # All rows are L2-normalized by encode(). Sanity check.
         norms = np.linalg.norm(emb, axis=1)
         if not np.allclose(norms, 1.0, atol=1e-3):
             sys.stderr.write(f"  WARN: norms range {norms.min():.4f}..{norms.max():.4f}\n")
-        np.save(dst, emb)
+        # Materialize final .npy and clean up partial.
+        np.save(dst, np.asarray(emb))
+        (DST_DIR / f"{task}.partial.npy").unlink(missing_ok=True)
+        (DST_DIR / f"{task}.partial.json").unlink(missing_ok=True)
         sys.stderr.write(f"  wrote {dst} in {(time.time()-t0)/60:.1f}min\n")
 
     sys.stderr.write("\nall done.\n")
