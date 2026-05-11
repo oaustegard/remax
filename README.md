@@ -78,6 +78,27 @@ The two coexist:
 - Use **remax** when you need a pure-rank in-memory tier with a precision ladder that doesn't break in the middle.
 - Use **both** if your two-stage retrieval architecture wants a remax-ladder Stage 1 and remex Stage 2.
 
+## Related work: training-time alternatives
+
+The same diagnosis remax operates on — *distribution shape, not codebook cleverness, dominates 1-bit quality* — can be applied at training time instead of inference time.
+
+[**jina-embeddings-v5**](https://arxiv.org/abs/2602.15547) (Apr 2026) bakes a Global Orthogonal Regularizer (GOR) into the contrastive loss of its retrieval adapter, penalizing squared cosine between non-matching embeddings to push them toward uniform-on-sphere distribution. The same technique appears in [embeddinggemma](https://arxiv.org/abs/2509.20354) (Vera et al. 2025), tracing back to [Zhang et al. 2017](https://arxiv.org/abs/1708.06320).
+
+Jina v5's Table 6 quantifies the binary-quantization gain: GOR cuts the BF16 → binary loss roughly in half at negligible BF16 cost.
+
+| Configuration | MTEB BF16 | MTEB Binary  | RTEB BF16 | RTEB Binary  |
+|---------------|-----------|--------------|-----------|--------------|
+| With GOR      | 64.50     | 62.60 (−1.90) | 66.45    | 63.94 (−2.51) |
+| Without GOR   | 64.21     | 61.13 (−3.08) | 66.16    | 62.24 (−3.92) |
+
+What this means for remax:
+
+- **On GOR-trained models**, corpus-mean centering should provide less marginal uplift — the model is already approximately uniform-on-sphere. The +0.324 R@100 gain remax measures on raw SPECTER2 is doing work that GOR-style training would have done upstream.
+- **Stacked-rotation variance reduction is orthogonal to GOR.** k independent SimHashes reduce variance ∝ 1/k regardless of whether the input distribution was pre-sphericalized. The precision ladder still applies.
+- **~2 points of binary headroom remain** even on GOR-trained embeddings. That's remax's continuing addressable problem on training-aware models; on uncorrected embeddings (raw SPECTER2, untrained-for-quantization encoders) the gap is substantially larger.
+
+If your encoder is GOR-trained, expect remax's centering step to be near-no-op and the stacked ladder to do most of the lifting. If it isn't, both stages contribute.
+
 ## Background
 
 This library emerged from a series of experiments documented on [muninn.austegard.com](https://muninn.austegard.com):
