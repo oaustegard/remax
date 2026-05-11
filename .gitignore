@@ -26,6 +26,7 @@ bench/results/*
 !bench/results/rerank_topn_sweep.csv
 !bench/results/rerank_topn_sweep.png
 !bench/results/BM25_SKETCH.md
+!bench/results/BM25_FOLLOWUP.md
 
 # IDE
 .vscode/
