@@ -27,6 +27,8 @@ bench/results/*
 !bench/results/rerank_topn_sweep.png
 !bench/results/BM25_SKETCH.md
 !bench/results/BM25_FOLLOWUP.md
+!bench/results/JINA_V5_BEIR.md
+!bench/results/jina_v5_beir.csv
 
 # IDE
 .vscode/
