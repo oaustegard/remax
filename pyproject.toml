@@ -13,7 +13,7 @@ authors = [{name = "Oskar Austegard"}]
 dependencies = ["numpy>=1.24", "scipy>=1.10"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov"]
+dev = ["pytest>=7.0", "pytest-cov", "rank_bm25"]
 bench = ["sentence-transformers", "matplotlib", "remex>=0.5.1"]
 rerank = ["onnxruntime", "tokenizers", "huggingface_hub"]
 
