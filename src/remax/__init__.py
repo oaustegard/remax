@@ -24,6 +24,8 @@ from .core import (
     hamming_search,
 )
 from .corpus import Corpus, Result
+from .itq import StackedITQQuantizer
+from .rotation import itq_rotation
 from .stacked import StackedSignBitQuantizer
 from ._native import AVAILABLE as NATIVE_AVAILABLE
 
@@ -32,9 +34,11 @@ __version__ = "0.0.0"
 __all__ = [
     "SignBitQuantizer",
     "StackedSignBitQuantizer",
+    "StackedITQQuantizer",
     "Corpus",
     "Result",
     "haar_rotation",
+    "itq_rotation",
     "encode_signs",
     "hamming_distances",
     "hamming_search",

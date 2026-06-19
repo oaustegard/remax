@@ -29,6 +29,7 @@ bench/results/*
 !bench/results/BM25_FOLLOWUP.md
 !bench/results/JINA_V5_BEIR.md
 !bench/results/jina_v5_beir.csv
+!bench/results/ITQ.md
 
 # IDE
 .vscode/
