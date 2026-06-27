@@ -412,6 +412,45 @@ def test_encoded_layout_is_per_row_concatenation():
         )
 
 
+def test_rotation_matrix_consistent_with_rotations():
+    """The flattened ``_rotation_matrix`` used by the encode matmul must stay
+    in lockstep with the per-stack ``rotations_``: column block j equals
+    ``rotations_[j]``. Guards against the two desyncing in a future refactor.
+    """
+    d, k = 64, 4
+    q = StackedSignBitQuantizer(d=d, k=k, seed=11)
+    assert q._rotation_matrix.shape == (d, k * d)
+    for j in range(k):
+        np.testing.assert_array_equal(
+            q._rotation_matrix[:, j * d : (j + 1) * d], q.rotations_[j]
+        )
+
+
+def test_encode_matmul_matches_einsum_reference():
+    """encode() (single batched matmul) is byte-identical to the explicit
+    per-stack einsum + transpose reference across shapes, including the 1-D
+    single-vector path.
+    """
+    def einsum_ref(qz, X):
+        X = np.asarray(X, dtype=qz.dtype)
+        squeezed = X.ndim == 1
+        if squeezed:
+            X = X[None, :]
+        rotated = np.einsum("kde,nd->kne", qz.rotations_, X, optimize=True)
+        packed = np.packbits(rotated > 0, axis=-1)
+        codes = np.ascontiguousarray(packed.transpose(1, 0, 2)).reshape(
+            X.shape[0], qz.k * (qz.d // 8)
+        )
+        return codes[0] if squeezed else codes
+
+    rng = np.random.default_rng(7)
+    for d, k in [(128, 1), (256, 2), (64, 5)]:
+        q = StackedSignBitQuantizer(d=d, k=k, seed=7)
+        X = rng.standard_normal((40, d))
+        np.testing.assert_array_equal(q.encode(X), einsum_ref(q, X))
+        np.testing.assert_array_equal(q.encode(X[0]), einsum_ref(q, X[0]))
+
+
 def test_search_class_matches_manual_hamming():
     """Top-k from .search() agrees with manual Hamming over the full code."""
     rng = np.random.default_rng(13)
