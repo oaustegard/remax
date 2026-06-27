@@ -60,11 +60,17 @@ _C_SOURCE = r"""
  *
  * n and B are int64_t so corpora with > 2^31 rows are handled correctly.
  * (32-bit `int` truncated silently and produced garbage at scale.)
+ *
+ * out is int32_t: a Hamming distance is at most 8*B bits, which would
+ * overflow int32 only past a ~256 MB code — never in practice — so the
+ * narrower output halves this bandwidth-bound scan's write traffic and lets
+ * the downstream top-k argpartition run over int32. The accumulator stays
+ * int64 and is cast on store.
  */
 void hamming_scan(
     const uint8_t *corpus,   /* (n, B) row-major */
     const uint8_t *query,    /* (B,) */
-    int64_t       *out,      /* (n,) output distances */
+    int32_t       *out,      /* (n,) output distances */
     int64_t        n,        /* number of corpus rows */
     int64_t        B         /* bytes per code */
 ) {
@@ -86,7 +92,7 @@ void hamming_scan(
             dist += __builtin_popcount(row[j] ^ query[j]);
         }
 
-        out[i] = dist;
+        out[i] = (int32_t)dist;
     }
 }
 """
@@ -260,7 +266,7 @@ def hamming_distances_native(
         )
 
     n, B = codes.shape
-    out = np.empty(n, dtype=np.int64)
+    out = np.empty(n, dtype=np.int32)
 
     _lib.hamming_scan(
         codes.ctypes.data,
