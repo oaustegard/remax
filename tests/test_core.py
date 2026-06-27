@@ -398,6 +398,31 @@ def test_search_class_matches_full_argsort_with_ties():
     np.testing.assert_array_equal(manual_top10, cls_top10)
 
 
+def test_hamming_distances_is_int32_search_returns_int64():
+    """hamming_distances returns int32 (narrow, for the top-k argpartition)
+    with values exact, while search widens its returned top-k distances back
+    to int64 for the public contract. Covers both the native and LUT paths.
+    """
+    from remax.packing import hamming_distances, POPCOUNT_LUT
+
+    rng = np.random.default_rng(21)
+    n, d = 1000, 256
+    X = rng.standard_normal((n, d))
+    q = SignBitQuantizer(d=d, seed=21)
+    codes = q.encode(X)
+    qcode = q.encode(X[3])
+
+    dists = hamming_distances(codes, qcode)
+    assert dists.dtype == np.int32
+    ref = POPCOUNT_LUT[np.bitwise_xor(codes, qcode[None, :])].sum(
+        axis=1, dtype=np.int64
+    )
+    np.testing.assert_array_equal(dists.astype(np.int64), ref)
+
+    _, top_dists = q.search(X[3], codes, k=10, return_distances=True)
+    assert top_dists.dtype == np.int64
+
+
 # --------------------------------------------------------------------- #
 # 4. Working-precision (dtype) parity
 # --------------------------------------------------------------------- #
