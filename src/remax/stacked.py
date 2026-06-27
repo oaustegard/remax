@@ -150,6 +150,18 @@ class StackedSignBitQuantizer:
             )
         self.rotations_: np.ndarray = rotations
 
+        # Pre-flatten the k rotations into a single (d, k * d) projection
+        # matrix so encode() can apply all stacks with one BLAS matmul
+        # (X @ self._rotation_matrix) instead of an einsum followed by a
+        # transpose-copy of a (k, n, d) intermediate. Stacking the rotations
+        # side by side in rotation order, combined with d % 8 == 0, means the
+        # packed bits already land in the row-contiguous (n, k * d // 8)
+        # layout — no rearrange needed. Output is bit-identical to the einsum
+        # path; see encode().
+        self._rotation_matrix: np.ndarray = np.ascontiguousarray(
+            rotations.transpose(1, 0, 2).reshape(self.d, self.k * self.d)
+        )
+
     # ------------------------------------------------------------------ #
     # sklearn-style API
     # ------------------------------------------------------------------ #
@@ -192,25 +204,20 @@ class StackedSignBitQuantizer:
                 f"X has {X.shape[1]} columns; expected {self.d}."
             )
 
-        # Apply all k rotations in a single batched matmul.
-        # rotations_: (k, d_in, d_out) shape (k, d, d). X: (n, d_in).
-        # Want rotated[k, n, e] = sum_d X[n, d] · rotations_[k, d, e],
-        # i.e. (X @ rotations_[k]) for every k. Einsum shared index is d.
-        rotated = np.einsum("kde,nd->kne", self.rotations_, X, optimize=True)
+        # Apply all k rotations with a single BLAS matmul against the
+        # pre-flattened (d, k * d) projection matrix built in __init__.
+        # rotated[n, j*d + e] = sum_d X[n, d] · rotations_[j, d, e], i.e. the
+        # k per-stack projections concatenated along the column axis in
+        # rotation order.
+        rotated = X @ self._rotation_matrix  # (n, k * d)
 
-        # Sign-pack each (k, n, d) along the last axis.
-        # np.packbits packs along the last axis by default (big-endian within
-        # each byte, matching encode_signs in packing.py).
-        bits = rotated > 0  # (k, n, d) bool
-        packed = np.packbits(bits, axis=-1)  # (k, n, d // 8) uint8
-
-        # Re-arrange to (n, k * d // 8): contiguous per-row layout.
-        # transpose to (n, k, d // 8) then reshape collapses k and d//8 in
-        # row-major order, giving the per-row contiguous layout described
-        # in the class docstring.
-        codes = np.ascontiguousarray(
-            packed.transpose(1, 0, 2)
-        ).reshape(X.shape[0], self.k * (self.d // 8))
+        # Sign-pack the full row in one go. packbits is big-endian within each
+        # byte (matching encode_signs in packing.py); because each stack spans
+        # exactly d bits and d % 8 == 0, signature boundaries fall on byte
+        # boundaries, so the result is already the row-contiguous
+        # (n, k * d // 8) layout described in the class docstring — no
+        # transpose-copy of a (k, n, d) intermediate.
+        codes = np.packbits(rotated > 0, axis=1)  # (n, k * d // 8) uint8
 
         return codes[0] if squeezed else codes
 
