@@ -81,8 +81,11 @@ def hamming_distances(
 
     Returns
     -------
-    distances : np.ndarray, shape (n,), dtype int64
-        Per-row Hamming distance, in ``[0, 8 * B]``.
+    distances : np.ndarray, shape (n,), dtype int32
+        Per-row Hamming distance, in ``[0, 8 * B]``. int32 is exact for any
+        practical code width (8 * B overflows int32 only past a ~256 MB code)
+        and keeps the downstream top-k argpartition narrow; ``search`` widens
+        the returned top-k slice back to int64 for its public contract.
     """
     codes = np.ascontiguousarray(codes, dtype=np.uint8)
     q = np.ascontiguousarray(query_code, dtype=np.uint8)
@@ -98,7 +101,7 @@ def hamming_distances(
     xor = np.bitwise_xor(codes, q[None, :])
     # POPCOUNT_LUT[xor] is (n, B) uint16 — popcount per byte. Sum across
     # bytes gives total Hamming distance per row.
-    return POPCOUNT_LUT[xor].sum(axis=1, dtype=np.int64)
+    return POPCOUNT_LUT[xor].sum(axis=1, dtype=np.int32)
 
 
 def stable_top_k(dists: np.ndarray, k: int) -> np.ndarray:
