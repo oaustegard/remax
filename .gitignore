@@ -35,3 +35,6 @@ bench/results/*
 .idea/
 *.swp
 .DS_Store
+!bench/results/NEMOTRON_1BIT.md
+!bench/results/nemotron_1bit.csv
+!bench/results/nemotron_1bit.png
