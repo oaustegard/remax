@@ -69,21 +69,100 @@ Same bytes/vec budget — remax 1-bit vs float32 Matryoshka slice. Positive Δ m
 
 remax 1-bit dominates float32 truncation at **every** matched memory budget, on both tasks. The gap is largest on retrieval (SciFact) and at the tightest budgets: at 256 bytes, 1-bit sign codes recover 76% of the float top-10 while a 64-dim float slice recovers 24%.
 
+## Robustness: multi-seed error bars
+
+The remax bit methods depend on the random Haar rotation (seed); float32 is
+deterministic. Re-running the six bit methods over **seeds 0–4** (mean ± std):
+
+| method | bytes | SciFact R@10 | SciFact nDCG@10 | STS-B ρ |
+|--------|-------|--------------|-----------------|---------|
+| bit1_2048 | 256 | 0.755 ± 0.004 | 0.825 ± 0.008 | 0.8445 ± 0.0010 |
+| bit1_stack2 | 512 | 0.818 ± 0.006 | 0.835 ± 0.002 | 0.8463 ± 0.0007 |
+| bit1_stack4 | 1024 | 0.870 ± 0.002 | 0.838 ± 0.003 | 0.8470 ± 0.0004 |
+| bit1_mrl1024 | 128 | 0.620 ± 0.005 | 0.802 ± 0.008 | 0.8431 ± 0.0019 |
+| bit1_mrl512 | 64 | 0.486 ± 0.005 | 0.737 ± 0.006 | 0.8364 ± 0.0026 |
+| bit1_mrl256 | 32 | 0.343 ± 0.010 | 0.627 ± 0.008 | 0.8211 ± 0.0044 |
+
+Std ≤ 0.01 on every metric — the near-lossless result is **not** a lucky
+rotation. (These supersede the seed-0 point estimates in the table above, which
+differ by < 0.01.)
+
+## Baselines: int8 and product quantization at matched byte budgets
+
+remax 1-bit is data-oblivious. The two standard competitors are **int8** scalar
+quantization (also data-oblivious, but only 4× at full dims — to compress
+further it must truncate dimensions) and **product quantization** (faiss PQ,
+`nbits=8`; **data-dependent** — it trains a codebook on the corpus). Matched
+byte budgets, same metrics (`nemotron_baselines.csv`, figure
+`nemotron_baselines.png`):
+
+**The 256-byte budget (32× compression) — head to head:**
+
+| method | family | data-dependent? | SciFact nDCG@10 | SciFact R@10 | STS-B ρ |
+|--------|--------|:---------------:|-----------------|--------------|---------|
+| **remax bit1_2048** | remax | no | **0.825** | **0.755** | **0.845** |
+| pq_m256 | PQ | **yes** (trains) | 0.811 | 0.753 | 0.798 |
+| int8_mrl256 | int8 | no | 0.760 | 0.553 | 0.845 |
+| f32_mrl64 | float32 | no | 0.490 | 0.240 | 0.808 |
+
+The full ladders show *why* each competitor fails at low bytes:
+- **int8** is near-lossless per dimension (int8_2048 = 0.844 nDCG at 4×, ties
+  float32), but reaching 32× forces it down to a 256-dim slice, and truncation
+  destroys retrieval ranking (0.760 nDCG, 0.553 R@10). On STS-B it stays even
+  with remax (similarity tolerates truncation far better than retrieval).
+- **PQ** is the strongest retrieval competitor — at 256 B it nearly matches
+  remax (0.811 vs 0.825 nDCG). But it collapses on STS-B similarity
+  (0.798, and 0.542 at 32 B) and it needs a training corpus (M=256 fails to
+  train on < 9,984 docs — a real deployment constraint remax doesn't have).
+
+## Latency / throughput
+
+Query-time cost, SciFact corpus (1,600 docs × 300 queries), single thread,
+k=10, best of 5 (`nemotron_latency.csv`):
+
+| method | family | bytes/vec | index MB | per-query ms (median) | queries/sec |
+|--------|--------|-----------|----------|----------------------|-------------|
+| f32_mrl256 | float32 | 1024 | 1.56 | 0.020 | 50,492 |
+| f32_2048 | float32 | 8192 | 12.50 | 0.038 | 26,352 |
+| int8_2048 | int8 | 2048 | 3.12 | 0.042 | 22,626 |
+| bit1_2048 | remax | 256 | **0.39** | 0.042 | 23,325 |
+| bit1_stack4 | remax | 1024 | 1.56 | 0.155 | 6,428 |
+
+**Honest reading of latency**: at n = 1,600 the corpus is far too small for
+scan *speed* to be remax's win — a BLAS float32 matmul over 1,600 vectors is
+already sub-40 µs, and the pure-numpy popcount Hamming scan is in the same
+ballpark (stacked k=4 is actually slower). remax's decisive advantage here is
+**index size**: 0.39 MB vs 12.5 MB for float32 (32×). The throughput crossover
+where a packed Hamming scan beats a bandwidth-bound float scan lives at much
+larger n — that is exactly remex's `IVFCoarseIndex` territory, out of scope for
+this experiment.
+
 ## Reading
 
 - **1-bit at 32× is near-lossless for ranking, and stacking closes the rest.** Full-dimension 1-bit (256 B, 32×) costs only −0.022 nDCG@10 on SciFact and −0.003 Spearman on STS-B. `StackedSignBitQuantizer` k=4 (1024 B, 8×) matches float32 nDCG@10 against the qrels (+0.0002) while recovering 87% of float32's own top-10 (R@10 = 0.871) — the 13% it reorders are swaps among near-equivalent-relevance docs, which is why measured nDCG is unchanged. This is the one-bit-beats-two thesis reproduced on a new 2026 model family: sign bits preserve angular rank; the value ladder is stacking, not more bits per coordinate.
 - **Sign-bit precision beats dimensional truncation, decisively.** At a fixed byte budget, spend it on sign bits over all dimensions, not float32 over a Matryoshka prefix. The 256-byte pair is the clearest: 1-bit@2048 (nDCG 0.820) vs float32@64 (nDCG 0.490). Truncating to 64 dims throws away the coordinates that carry the ranking; keeping all 2048 sign bits keeps them.
 - **The two tasks stress different things and agree.** STS-B (pairwise similarity, Spearman) is far more forgiving than SciFact (top-10 retrieval) — every method stays above ρ = 0.82 — but the ordering of methods is identical across both, so the conclusion is not a retrieval-only artifact.
-- **Memory in absolute terms.** A 1M-vector Nemotron index is 8.0 GB at float32, 256 MB at 1-bit (32×), 32 MB at 1-bit-on-256-slice (256×). The 32× point is the sweet spot: it fits an index 32× larger in the same RAM at a −0.02 nDCG cost.
+- **Against real baselines, remax is the robust generalist — the only method on the upper-left frontier of *both* tasks.** int8 ties remax on similarity but collapses on retrieval below ~2 KB/vec, because compressing past 4× forces dimensional truncation. PQ is a near-match on retrieval but collapses on similarity *and* needs a training corpus (a fit step, and it fails outright on small corpora). remax needs neither — it is data-oblivious, hits 32× without truncating, and stays top-tier on similarity and retrieval alike (see `nemotron_baselines.png`). That robustness, not a win on any single metric, is the result.
+- **Memory in absolute terms.** A 1M-vector Nemotron index is 8.0 GB at float32, 256 MB at 1-bit (32×), 32 MB at 1-bit-on-256-slice (256×). The 32× point is the sweet spot: it fits an index 32× larger in the same RAM at a −0.02 nDCG cost. At n = 1,600 that memory win does not yet translate to a *speed* win (the flat float scan is already sub-40 µs); the latency crossover is a large-n regime this experiment doesn't reach.
+- **Caveat — BF16 proxy, single model.** All numbers are on the BF16 embeddings; the NVFP4 checkpoint (GPU + vLLM) was not run here. remax quantizes the emitted vectors and is orthogonal to NVFP4 weight quantization, but that composition is argued, not measured. Two datasets on one model family — a signal, not a benchmark sweep.
 
 ## Reproduce
 
 ```bash
+# Skip the ~1h CPU encode by fetching the published embedding cache:
+bash bench/fetch_nemotron_cache.sh   # -> bench/.cache/NEMOTRON/{emb,data}
+export NEMOTRON_EMB_DIR=bench/.cache/NEMOTRON/emb NEMOTRON_DATA_DIR=bench/.cache/NEMOTRON/data
+# ...or encode from scratch:
 python3 bench/embed_nemotron.py            # encode SciFact + STS-B (CPU, resumable)
-python3 bench/eval_nemotron_1bit.py        # -> bench/results/nemotron_1bit.csv
-python3 bench/plot_nemotron_1bit.py        # -> bench/results/nemotron_1bit.png
-# offline selftests (no model/network):
-python3 bench/embed_nemotron.py --selftest
-python3 bench/eval_nemotron_1bit.py --selftest
-python3 bench/plot_nemotron_1bit.py --selftest
+
+python3 bench/eval_nemotron_1bit.py        # -> nemotron_1bit.csv   (headline grid)
+python3 bench/eval_nemotron_seeds.py       # -> nemotron_seeds.csv  (mean±std, seeds 0-4)
+python3 bench/baselines_nemotron.py        # -> nemotron_baselines.csv (int8 + PQ)
+python3 bench/latency_nemotron.py          # -> nemotron_latency.csv
+python3 bench/plot_nemotron_1bit.py        # -> nemotron_1bit.png
+# offline selftests (no model/network) — every script supports --selftest:
+for s in embed eval plot; do python3 bench/${s}_nemotron*.py --selftest; done
+python3 bench/eval_nemotron_seeds.py --selftest
+python3 bench/baselines_nemotron.py --selftest
+python3 bench/latency_nemotron.py --selftest
 ```
