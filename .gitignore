@@ -42,3 +42,5 @@ bench/results/*
 !bench/results/nemotron_baselines.csv
 !bench/results/nemotron_baselines.png
 !bench/results/nemotron_latency.csv
+!bench/results/nemotron_nvfp4.csv
+!bench/results/nemotron_remex.csv

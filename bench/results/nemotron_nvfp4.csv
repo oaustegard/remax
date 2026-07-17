@@ -1,0 +1,13 @@
+dataset,embset,method,bytes_per_vec,r10_vs_bf16,ndcg10,spearman
+scifact,bf16,full_f32,8192,1.0,0.8419,
+scifact,bf16,remax_1bit,256,0.7613,0.8196,
+scifact,bf16,remax_stack4,1024,0.8707,0.8421,
+stsb,bf16,full_f32,8192,,,0.8478
+stsb,bf16,remax_1bit,256,,,0.8447
+stsb,bf16,remax_stack4,1024,,,0.847
+scifact,nvfp4,full_f32,8192,0.95,0.8419,
+scifact,nvfp4,remax_1bit,256,0.7577,0.8227,
+scifact,nvfp4,remax_stack4,1024,0.8583,0.8376,
+stsb,nvfp4,full_f32,8192,,,0.8484
+stsb,nvfp4,remax_1bit,256,,,0.8456
+stsb,nvfp4,remax_stack4,1024,,,0.8471
