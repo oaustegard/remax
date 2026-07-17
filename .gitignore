@@ -38,3 +38,11 @@ bench/results/*
 !bench/results/NEMOTRON_1BIT.md
 !bench/results/nemotron_1bit.csv
 !bench/results/nemotron_1bit.png
+!bench/results/nemotron_seeds.csv
+!bench/results/nemotron_baselines.csv
+!bench/results/nemotron_baselines.png
+!bench/results/nemotron_latency.csv
+!bench/results/nemotron_nvfp4.csv
+!bench/results/nemotron_remex.csv
+!bench/results/nemotron_master.png
+!bench/results/NEMOTRON_MASTER.md

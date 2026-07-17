@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -41,10 +42,15 @@ except ImportError:
 
 
 SCRATCH = Path(
-    "/tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad"
+    os.environ.get(
+        "NEMOTRON_SCRATCH",
+        "/tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad",
+    )
 )
-DATA_DIR = SCRATCH / "data"
-EMB_DIR = SCRATCH / "emb"
+# Env overrides let the published cache (fetch_nemotron_cache.sh) drop in
+# without editing paths; default to the session scratch dir.
+DATA_DIR = Path(os.environ.get("NEMOTRON_DATA_DIR", SCRATCH / "data"))
+EMB_DIR = Path(os.environ.get("NEMOTRON_EMB_DIR", SCRATCH / "emb"))
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 # Contract: base embedding dimension

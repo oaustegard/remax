@@ -1,0 +1,7 @@
+dataset,method,bits,bytes_per_vec,compression_x,r10_mean,r10_std,ndcg10_mean,ndcg10_std,spearman_mean,spearman_std
+scifact,remex_2bit,2,516,15.8760,0.9101,0.0018,0.8394,0.0028,,
+scifact,remex_3bit,3,772,10.6114,0.9508,0.0032,0.8394,0.0023,,
+scifact,remex_4bit,4,1028,7.9689,0.9719,0.0020,0.8413,0.0029,,
+stsb,remex_2bit,2,516,15.8760,,,,,0.8468,0.0006
+stsb,remex_3bit,3,772,10.6114,,,,,0.8471,0.0007
+stsb,remex_4bit,4,1028,7.9689,,,,,0.8476,0.0003
