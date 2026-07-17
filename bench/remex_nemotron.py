@@ -36,14 +36,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "remex"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Import remex
+from functools import lru_cache
+
 from remex import Quantizer
+from remex.rotation import haar_rotation
+
+
+@lru_cache(maxsize=None)
+def _cached_quantizer(bits: int) -> "Quantizer":
+    """Build one Quantizer per bit level (the Lloyd-Max codebook + QR rotation
+    cost ~25s each and depend only on (d, bits)). Reused across seeds and across
+    both datasets; the per-seed rotation is swapped in separately."""
+    return Quantizer(d=BASE_DIM, bits=bits, seed=0)
+
+
+@lru_cache(maxsize=None)
+def _cached_rotation(seed: int) -> "np.ndarray":
+    """One Haar rotation per seed, shared across all bit levels (the rotation is
+    independent of bit width)."""
+    return haar_rotation(BASE_DIM, seed)
 
 # Import helpers from the 1-bit evaluation
 from eval_nemotron_1bit import slice_renorm, r10_vs_float, ndcg_at_k, EMB_DIR, DATA_DIR, RESULTS_DIR
 
 # Contract: base embedding dimension
 BASE_DIM = 2048
-BIT_LEVELS = [2, 3, 4, 8]
+# 8-bit dropped: at 8 bits/coord (2052 B/vec) there is no meaningful index-size
+# win over int8 (2048 B) or the float baseline, and the Lloyd-Max 8-bit codebook
+# is very slow to build. The compression story lives at 2-4 bits.
+BIT_LEVELS = [2, 3, 4]
 SEEDS = [0, 1, 2, 3, 4]
 SELFTEST_BIT_LEVELS = [2, 3, 4]  # Skip 8-bit in selftest (slow codebook init)
 
@@ -85,12 +106,16 @@ def evaluate_scifact_remex(
         r10_scores = []
         ndcg10_scores = []
 
+        # The Lloyd-Max codebook depends only on (d, bits), not seed — build it
+        # once (cached across seeds AND across both datasets) and swap only the
+        # per-seed Haar rotation, which is itself cached and bit-width-independent.
+        q = _cached_quantizer(bits)
+        bytes_per_vec = q.encode(corpus_full[:1]).nbytes  # (1-row) → bytes/vec
         for seed in SEEDS:
-            # Encode corpus with remex
-            q = Quantizer(d=BASE_DIM, bits=bits, seed=seed)
+            q.R = _cached_rotation(seed)
+            q.seed = seed
             cv_corpus = q.encode(corpus_full)
             xhat_corpus = q.decode(cv_corpus)  # (n, 2048) float32
-            bytes_per_vec = cv_corpus.nbytes / cv_corpus.n
 
             # Score: queries_float @ xhat_corpus.T (asymmetric ADC design)
             scores = queries_full @ xhat_corpus.T  # (m, n)
@@ -114,10 +139,6 @@ def evaluate_scifact_remex(
         ndcg10_mean = float(np.mean(ndcg10_scores))
         ndcg10_std = float(np.std(ndcg10_scores))
 
-        # Compute compression ratio (use first seed's bytes_per_vec, they're all the same)
-        q_first = Quantizer(d=BASE_DIM, bits=bits, seed=SEEDS[0])
-        cv_first = q_first.encode(corpus_full[:1])
-        bytes_per_vec = cv_first.nbytes / cv_first.n
         compression_x = 8192 / bytes_per_vec  # BASE_DIM * 4 / bytes_per_vec
 
         rows.append({
@@ -165,9 +186,12 @@ def evaluate_stsb_remex(
 
         spearman_scores = []
 
+        # Build codebook once per bit level; swap only the rotation per seed.
+        q = _cached_quantizer(bits)
+        bytes_per_vec = q.encode(s1[:1]).nbytes
         for seed in SEEDS:
-            # Encode both s1 and s2 with remex
-            q = Quantizer(d=BASE_DIM, bits=bits, seed=seed)
+            q.R = _cached_rotation(seed)
+            q.seed = seed
             cv_s1 = q.encode(s1)
             cv_s2 = q.encode(s2)
             xhat_s1 = q.decode(cv_s1)  # (n, 2048) float32
@@ -188,10 +212,6 @@ def evaluate_stsb_remex(
         spearman_mean = float(np.mean(spearman_scores))
         spearman_std = float(np.std(spearman_scores))
 
-        # Compute compression ratio (use first seed's bytes_per_vec)
-        q_first = Quantizer(d=BASE_DIM, bits=bits, seed=SEEDS[0])
-        cv_first = q_first.encode(s1[:1])
-        bytes_per_vec = cv_first.nbytes / cv_first.n
         compression_x = 8192 / bytes_per_vec  # BASE_DIM * 4 / bytes_per_vec
 
         rows.append({
