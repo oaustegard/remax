@@ -59,3 +59,5 @@ bench/results/*
 !bench/results/lfm25_learned_rotation_holdout.json
 !bench/results/lfm25_frozen_classifier.json
 !bench/results/lfm25_finetune_feasibility.json
+!bench/results/lfm25_finetune_retrieval.json
+!bench/results/lfm25_finetune_retrieval_1epoch.json
