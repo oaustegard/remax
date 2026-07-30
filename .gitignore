@@ -54,3 +54,4 @@ bench/results/*
 !bench/results/lfm25_rerank.json
 !bench/results/lfm25_pareto.png
 !bench/results/lfm25_asymmetric.json
+!bench/results/lfm25_asymmetric.png

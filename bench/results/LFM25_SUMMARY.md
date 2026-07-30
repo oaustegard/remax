@@ -161,6 +161,29 @@ Free at the index level, and the harder the compression the more the query
 precision carries. It does **not** reach fp32 (0.7122) standalone — it closes the
 gap to remex, not to uncompressed. Reproduce with `bench/asymmetric_lfm25.py`.
 
+### Asymmetry substitutes for stacking
+
+Stacking and asymmetry buy down the same error — the variance of a similarity
+estimated from sign bits. Stacking pays index bytes for it; asymmetry pays nothing.
+
+| codec | B/vec | symmetric | asymmetric | delta |
+|---|--:|--:|--:|--:|
+| k=1 | 128 | 0.6772 | **0.7020** | +0.0248 |
+| k=2 | 256 | 0.6989 | 0.7022 | +0.0033 |
+| k=4 | 512 | 0.7078 | 0.7111 | +0.0033 |
+
+Two consequences worth acting on:
+
+- **Asymmetric k=1 (128 B, 0.7020) beats symmetric k=2 (256 B, 0.6989).** Turning
+  on asymmetry is worth more than doubling the index.
+- **Under asymmetric scoring, k=2 buys essentially nothing** (0.7022 vs 0.7020 for
+  k=1 at twice the bytes). The k=2 stack exists to reduce estimator variance, and
+  asymmetry has already taken that slack. The gain collapsing from +0.0248 to
+  +0.0033 the moment you stack is the same fact seen from the other side.
+
+If you are scoring asymmetrically, spend bytes on k=4 or not at all — k=2 is a
+dominated configuration on this embedder.
+
 ## Scope and limits
 
 - One dataset (SciFact), one seed, 300 queries. Differences under ~0.005 nDCG are
