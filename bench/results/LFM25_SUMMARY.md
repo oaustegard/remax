@@ -95,10 +95,11 @@ jina-v3, which is MRL-trained, on the same task:
 | 128 | 0.6085 (-14.6%) | 0.6995 (-3.3%) |
 | 64 | 0.5092 (-28.5%) | 0.6494 (-10.2%) |
 
-LFM2.5 degrades roughly 3x faster under truncation. So the "no Matryoshka" caveat
-is real — it just doesn't bind, because quantization is strictly the better axis.
-(jina-v3 figures are published, measured on a different run; treat the comparison
-as directional.)
+LFM2.5 degrades 3-7x faster under truncation depending on depth (7.1x at 256 dims,
+4.5x at 128, 2.8x at 64; at 512 dims jina-v3 actually gains, so the ratio there is
+not meaningful). So the "no Matryoshka" caveat is real — it just doesn't bind,
+because quantization is strictly the better axis. (jina-v3 figures are published,
+measured on a different run; treat the comparison as directional.)
 
 ## Two-stage: 32x compression, no measured loss
 
