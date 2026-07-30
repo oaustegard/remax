@@ -54,6 +54,15 @@ Pure-Python first. Numpy/scipy only. Numba/SIMD optimizations are non-goals for 
 - Tests required. Synthetic Gaussian for unit, real embeddings for integration.
 - Bench artifacts (CSVs, plots) live under `bench/results/` (gitignored, except `.gitkeep`).
 - Reproduce blog post numbers in the v0.1.0 baseline as a smoke test.
+- **Check the remote before every commit — a merged PR cannot take new work.**
+  Long sessions merge a PR before the follow-up to it is written, and nothing
+  local says so. Run `git fetch origin main && git log --oneline origin/main..HEAD`
+  first. A `git push` printing `* [new branch]` for a branch you already pushed
+  once means the remote branch was deleted, i.e. its PR merged — stop and check
+  rather than reading past it. Recover by branching fresh from the updated
+  default and cherry-picking the orphans; never force-push a merged branch to
+  reuse it. (Happened twice here: #53 and #54 each merged while follow-up
+  commits were still landing on their branches.)
 
 ## Anti-goals for v0.1.0
 
