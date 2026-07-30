@@ -18,6 +18,8 @@ sign-packed count-sketch path was explored and removed — see
 from .characterize import CharacterizeReport, characterize
 from .core import (
     SignBitQuantizer,
+    asymmetric_scores,
+    asymmetric_search,
     encode_signs,
     haar_rotation,
     hamming_distances,
@@ -32,6 +34,8 @@ __version__ = "0.0.0"
 __all__ = [
     "SignBitQuantizer",
     "StackedSignBitQuantizer",
+    "asymmetric_scores",
+    "asymmetric_search",
     "Corpus",
     "Result",
     "haar_rotation",
