@@ -46,3 +46,10 @@ bench/results/*
 !bench/results/nemotron_remex.csv
 !bench/results/nemotron_master.png
 !bench/results/NEMOTRON_MASTER.md
+!bench/results/LFM25_SUMMARY.md
+!bench/results/LFM25_SCIFACT.md
+!bench/results/LFM25_MATCHED_BYTES.md
+!bench/results/LFM25_RERANK.md
+!bench/results/lfm25_scifact.json
+!bench/results/lfm25_rerank.json
+!bench/results/lfm25_pareto.png
