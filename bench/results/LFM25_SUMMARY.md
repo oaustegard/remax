@@ -135,6 +135,32 @@ SPECTER2; on LFM2.5 they are not. Same code, opposite curve — which is the sta
 conclusion of `docs/research/matryoshka-and-quantization.md` and now has a second
 confirming data point.
 
+> **Superseded, 2026-07-30.** The paragraph above attributed the remax/remex gap
+> to Lloyd-Max vs SimHash. That was wrong. The gap is **symmetric vs asymmetric
+> scoring**: remex decodes to float and takes an inner product, while remax's
+> `search` binarizes the query too. Giving remax an asymmetric path
+> (`search_asymmetric`, float query against the same sign-bit index) closes it
+> almost exactly — 0.7020 vs remex's 0.7018 at an identical 128 B/vec. See
+> `LFM25_ASYMMETRIC.md`. The codec comparison at matched bytes stands; the
+> explanation for it does not.
+
+## Asymmetric scoring
+
+Prompted by Exa's web-scale index, which stores document sign bits but keeps the
+query in float. The query is one vector per search and occupies no index storage,
+so binarizing it discards precision for nothing.
+
+| dim | B/vec | symmetric | asymmetric | delta |
+|--:|--:|--:|--:|--:|
+| 1024 | 128 | 0.6772 | **0.7020** | +0.0248 |
+| 512 | 64 | 0.6501 | 0.6859 | +0.0358 |
+| 256 | 32 | 0.5722 | 0.6191 | +0.0469 |
+| 128 | 16 | 0.4214 | **0.5282** | +0.1067 |
+
+Free at the index level, and the harder the compression the more the query
+precision carries. It does **not** reach fp32 (0.7122) standalone — it closes the
+gap to remex, not to uncompressed. Reproduce with `bench/asymmetric_lfm25.py`.
+
 ## Scope and limits
 
 - One dataset (SciFact), one seed, 300 queries. Differences under ~0.005 nDCG are

@@ -184,3 +184,100 @@ def hamming_search(
     if return_distances:
         return order, dists[order]
     return order
+
+
+# ── asymmetric scoring ───────────────────────────────────────────────────────
+#
+# Hamming search binarizes BOTH sides. That is symmetric and cheap, but the
+# query is a single vector per search -- it occupies no index storage -- so
+# throwing away its precision buys nothing. Keeping it in float and scoring it
+# against the +/-1 document bits is strictly more information at identical
+# storage cost.
+#
+# Exa's web-scale index (exa.ai/blog/building-web-scale-vector-db) makes this
+# choice, and measured on LFM2.5/SciFact it is worth +0.019 nDCG@10 at
+# 128 B/vector, widening to +0.084 at 16 B -- the harder you compress, the more
+# the query precision is carrying. See bench/results/lfm25_asymmetric.json.
+#
+# The obvious implementation unpacks the codes to a dense (n, d) +/-1 matrix and
+# calls BLAS, but that allocates 32x the index and defeats the point. Instead
+# precompute, per byte position, the partial dot product for all 256 possible
+# byte values, then score by gather-and-sum. That is Exa's subvector lookup
+# table at length 8 rather than length 4: O(n * d/8) table lookups instead of
+# O(n * d) multiply-accumulates, with no dense intermediate.
+
+_UNPACK_LUT = np.unpackbits(
+    np.arange(256, dtype=np.uint8)[:, None], axis=1
+).astype(np.float32)  # (256, 8), MSB-first to match np.packbits
+
+
+def asymmetric_scores(
+    query_rotated: np.ndarray,
+    codes: np.ndarray,
+    *,
+    chunk: int = 1 << 16,
+) -> np.ndarray:
+    """Dot product of a float query against sign-bit codes. Higher is better.
+
+    Parameters
+    ----------
+    query_rotated : np.ndarray, shape (d,)
+        Already-rotated query (caller applies ``query @ R``), NOT binarized.
+    codes : np.ndarray, shape (n, d // 8), dtype uint8
+        Bit-packed corpus from :func:`encode_signs`.
+    chunk : int, keyword-only
+        Rows scored per batch, bounding the (chunk, d/8) gather buffer.
+
+    Returns
+    -------
+    scores : np.ndarray, shape (n,), dtype float32
+        ``query . s`` where ``s`` is the corpus row decoded to +/-1.
+
+    Notes
+    -----
+    Codes store ``b = (x > 0)`` as 0/1, while the value they represent is
+    ``s = 2b - 1``. So ``q . s == 2 * (q . b) - sum(q)``. The table accumulates
+    ``q . b``; the affine correction is applied once at the end. It does not
+    change the ranking (``sum(q)`` is constant per query) but it makes the
+    returned scores true inner products, so they stay meaningful to callers
+    that threshold or fuse them rather than just sorting.
+    """
+    q = np.ascontiguousarray(query_rotated, dtype=np.float32).ravel()
+    codes = np.asarray(codes)
+    if codes.ndim != 2:
+        raise ValueError(f"codes must be 2-D, got ndim={codes.ndim}")
+    if codes.dtype != np.uint8:
+        raise ValueError(f"codes must be uint8, got {codes.dtype}")
+    n_bytes = codes.shape[1]
+    if q.size != n_bytes * 8:
+        raise ValueError(
+            f"query has {q.size} dims but codes carry {n_bytes * 8} bits."
+        )
+
+    # table[b, v] = partial dot product of the 8 dims in byte b against value v
+    table = np.ascontiguousarray((_UNPACK_LUT @ q.reshape(n_bytes, 8).T).T)
+    cols = np.arange(n_bytes)
+
+    out = np.empty(codes.shape[0], dtype=np.float32)
+    for start in range(0, codes.shape[0], chunk):
+        block = codes[start : start + chunk]
+        out[start : start + len(block)] = table[cols, block].sum(axis=1)
+    return 2.0 * out - q.sum(dtype=np.float32)
+
+
+def asymmetric_search(
+    query_rotated: np.ndarray,
+    codes: np.ndarray,
+    k: int = 10,
+    *,
+    return_scores: bool = False,
+):
+    """Top-k by asymmetric dot product. Mirrors :func:`hamming_search`."""
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
+    scores = asymmetric_scores(query_rotated, codes)
+    # stable_top_k is ascending, and higher score is better here.
+    order = stable_top_k(-scores, k)
+    if return_scores:
+        return order, scores[order]
+    return order

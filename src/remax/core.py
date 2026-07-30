@@ -31,6 +31,8 @@ import numpy as np
 # Re-export the functional API at this layer so callers can import either
 # ``from remax.core import haar_rotation`` or ``from remax import haar_rotation``.
 from .packing import (
+    asymmetric_scores,
+    asymmetric_search,
     encode_signs,
     hamming_distances,
     hamming_search,
@@ -40,6 +42,8 @@ from .rotation import haar_rotation
 
 __all__ = [
     "SignBitQuantizer",
+    "asymmetric_scores",
+    "asymmetric_search",
     "haar_rotation",
     "encode_signs",
     "hamming_distances",
@@ -228,4 +232,92 @@ class SignBitQuantizer:
             out_dist = out_dist[0]
         if return_distances:
             return out_idx, out_dist
+        return out_idx
+
+    def search_asymmetric(
+        self,
+        query: np.ndarray,
+        codes: np.ndarray,
+        k: int = 10,
+        *,
+        return_scores: bool = False,
+    ):
+        """Top-k by float-query-against-sign-bit dot product.
+
+        Same stored index as :meth:`search` -- the corpus is still one bit per
+        dimension. The only difference is that the query is NOT binarized: it
+        is rotated and kept in float, then scored against the +/-1 values the
+        code bits stand for.
+
+        That asymmetry is free. The query is a single vector per search and
+        occupies no index storage, so discarding its precision to make the
+        comparison symmetric buys nothing. Measured on LFM2.5/SciFact it is
+        worth +0.019 nDCG@10 at 128 B/vector and +0.084 at 16 B -- the harder
+        the compression, the more the query precision is carrying
+        (bench/asymmetric_lfm25.py). Exa's web-scale index makes the same
+        choice.
+
+        Trade-off vs :meth:`search`: scores are float rather than integer
+        Hamming distances, so this cannot use the SIMD popcount kernel and
+        costs a gather-and-sum per byte instead. Prefer :meth:`search` when
+        throughput dominates and recall is adequate; prefer this when recall
+        per stored byte matters, which is the usual reason to be at 1 bit.
+
+        Parameters
+        ----------
+        query : np.ndarray, shape (d,) or (m, d)
+            Raw (un-rotated) query vector(s).
+        codes : np.ndarray, shape (n, self.d // 8), dtype uint8
+            Encoded corpus from :meth:`encode` -- unchanged, no re-encoding.
+        k : int
+            Number of neighbours per query.
+        return_scores : bool, keyword-only
+            If True, also return the dot products of the top-k.
+
+        Returns
+        -------
+        indices : np.ndarray
+            ``(k,)`` for a single query, ``(m, k)`` for a batch.
+            Sorted DESCENDING by score (higher is nearer), ties broken stably.
+        scores : np.ndarray
+            Same leading shape, dtype ``float32``. Only if
+            ``return_scores=True``.
+        """
+        if k <= 0:
+            raise ValueError(f"k must be positive, got {k}")
+        query = np.asarray(query, dtype=self.dtype)
+        squeezed = False
+        if query.ndim == 1:
+            query = query[None, :]
+            squeezed = True
+        elif query.ndim != 2:
+            raise ValueError(f"query must be 1-D or 2-D, got ndim={query.ndim}")
+        if query.shape[1] != self.d:
+            raise ValueError(
+                f"query has {query.shape[1]} columns; expected {self.d}."
+            )
+        codes = np.ascontiguousarray(codes, dtype=np.uint8)
+        if codes.ndim != 2 or codes.shape[1] != self.d // 8:
+            raise ValueError(
+                f"codes shape {codes.shape} incompatible with d={self.d} "
+                f"(expected (n, {self.d // 8}))."
+            )
+
+        rotated = query @ self.rotation_
+        n = codes.shape[0]
+        k_eff = min(k, n)
+        out_idx = np.empty((query.shape[0], k_eff), dtype=np.intp)
+        out_sc = np.empty((query.shape[0], k_eff), dtype=np.float32)
+
+        for i in range(query.shape[0]):
+            scores = asymmetric_scores(rotated[i], codes)
+            order = stable_top_k(-scores, k_eff)
+            out_idx[i] = order
+            out_sc[i] = scores[order]
+
+        if squeezed:
+            out_idx = out_idx[0]
+            out_sc = out_sc[0]
+        if return_scores:
+            return out_idx, out_sc
         return out_idx
