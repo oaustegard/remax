@@ -1,0 +1,40 @@
+{
+  "batch": 8,
+  "seqlen": 512,
+  "labels": 10,
+  "device": "cpu",
+  "threads": 4,
+  "grad_checkpointing": false,
+  "rows": [
+    {
+      "mode": "full",
+      "per_step_s": 28.44310434659322,
+      "trainable": 354494218,
+      "total": 354494218,
+      "peak_rss_gb": 13.681804,
+      "examples_per_s": 0.2812632511035386,
+      "hours_3_epochs_5k": 14.81,
+      "trainable_pct": 100.0
+    },
+    {
+      "mode": "lora",
+      "per_step_s": 20.688082059224445,
+      "trainable": 1026058,
+      "total": 355510026,
+      "peak_rss_gb": 13.681804,
+      "examples_per_s": 0.3866960686398159,
+      "hours_3_epochs_5k": 10.78,
+      "trainable_pct": 0.2886
+    },
+    {
+      "mode": "frozen",
+      "per_step_s": 4.931518157323201,
+      "trainable": 10250,
+      "total": 354494218,
+      "peak_rss_gb": 13.681804,
+      "examples_per_s": 1.6222185024544962,
+      "hours_3_epochs_5k": 2.57,
+      "trainable_pct": 0.0029
+    }
+  ]
+}

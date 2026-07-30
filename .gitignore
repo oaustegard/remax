@@ -55,3 +55,7 @@ bench/results/*
 !bench/results/lfm25_pareto.png
 !bench/results/lfm25_asymmetric.json
 !bench/results/lfm25_asymmetric.png
+!bench/results/lfm25_learned_rotation.json
+!bench/results/lfm25_learned_rotation_holdout.json
+!bench/results/lfm25_frozen_classifier.json
+!bench/results/lfm25_finetune_feasibility.json
