@@ -275,20 +275,44 @@ AVAILABLE: bool = _lib is not None
 
 
 def hamming_distances_native(
-    codes: np.ndarray, query_code: np.ndarray
+    codes: np.ndarray, query_code: np.ndarray, *, out: np.ndarray | None = None
 ) -> np.ndarray:
-    """Hamming distance from query_code to every row of codes."""
+    """Hamming distance from query_code to every row of codes.
+
+    ``out``, when given, is an ``(n,)`` int32 C-contiguous buffer written in
+    place and returned. The kernel assigns every element (``out[i] = dist``),
+    so nothing from a previous call survives.
+
+    This function no longer copies ``codes``. It used to open with
+    ``np.ascontiguousarray(codes, dtype=np.uint8)`` — the third such call on
+    a path that already had two, and the one in the worst position, because
+    it sits inside the per-query loop. A non-contiguous array is now a
+    ``ValueError`` here rather than a silent whole-index copy: the public
+    entry point (:func:`remax.packing.as_codes`) is where a copy may happen,
+    once, with a warning. Passing a raw pointer to a strided buffer would
+    read garbage, so this check is load-bearing, not defensive.
+    """
     if _lib is None:
         raise RuntimeError(
             "Native scan not available; check remax._native.AVAILABLE "
             "before calling."
         )
 
-    codes = np.ascontiguousarray(codes, dtype=np.uint8)
     query_code = np.ascontiguousarray(query_code, dtype=np.uint8)
 
+    if not isinstance(codes, np.ndarray):
+        raise ValueError(f"codes must be a numpy array, got {type(codes).__name__}")
     if codes.ndim != 2:
         raise ValueError(f"codes must be 2-D, got ndim={codes.ndim}")
+    if codes.dtype != np.uint8:
+        raise ValueError(f"codes must be uint8, got dtype={codes.dtype}")
+    if not codes.flags["C_CONTIGUOUS"]:
+        raise ValueError(
+            "codes must be C-contiguous; the native kernel reads a raw "
+            "pointer and a strided buffer would give wrong distances. Pass "
+            "it through remax.packing.as_codes (or np.ascontiguousarray) "
+            "first — once, outside your query loop."
+        )
     if query_code.ndim != 1:
         raise ValueError(f"query_code must be 1-D, got ndim={query_code.ndim}")
     if query_code.shape[0] != codes.shape[1]:
@@ -298,7 +322,17 @@ def hamming_distances_native(
         )
 
     n, B = codes.shape
-    out = np.empty(n, dtype=np.int32)
+    if out is None:
+        out = np.empty(n, dtype=np.int32)
+    else:
+        if out.shape != (n,):
+            raise ValueError(f"out has shape {out.shape}; expected ({n},)")
+        if out.dtype != np.int32:
+            raise ValueError(f"out must be int32, got {out.dtype}")
+        if not out.flags["C_CONTIGUOUS"]:
+            raise ValueError("out must be C-contiguous")
+        if not out.flags["WRITEABLE"]:
+            raise ValueError("out must be writeable")
 
     _lib.hamming_scan(
         codes.ctypes.data,

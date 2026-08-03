@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -320,6 +321,14 @@ class Corpus:
         self._quantizer = SignBitQuantizer(**q_kwargs)
         self._db_path = str(db_path)
 
+        # Metadata connections, opened lazily and kept — see the block above
+        # _connection(). _connections is the registry close() drains; the
+        # thread-local is what a searching thread actually reaches for.
+        self._local = threading.local()
+        self._conn_lock = threading.Lock()
+        self._connections: list[sqlite3.Connection] = []
+        self._closed = False
+
         # Load corpus mean if persisted by build(center=True).
         mean_path = self._dir / _MEAN_NAME
         if mean_path.exists():
@@ -460,39 +469,144 @@ class Corpus:
     # Public API
     # ------------------------------------------------------------------ #
 
-    def search(self, query: np.ndarray, k: int = 10) -> list[Result]:
+    def search(self, query: np.ndarray, k: int = 10):
         """Return the top-k nearest neighbours with resolved metadata.
+
+        Parameters
+        ----------
+        query : np.ndarray, shape (d,) or (m, d)
+            A single query, or a batch of them.
+        k : int
+            Neighbours per query.
+
+        Returns
+        -------
+        list[Result] | list[list[Result]]
+            ``list[Result]`` for a 1-D query — unchanged. For a 2-D query,
+            one ``list[Result]`` per row, in input order.
+
+        Notes
+        -----
+        A 2-D query used to be accepted and then crash. ``self._quantizer.
+        search`` correctly produced ``(m, k)`` indices, ``.tolist()`` made a
+        list of lists, and that went into the SQLite ``IN (...)`` bind as a
+        parameter: ``sqlite3.ProgrammingError: Error binding parameter 1:
+        type 'list' is not supported`` (and, had it got past that,
+        ``lookup.get(list)`` -> ``TypeError: unhashable type: 'list'``). Every
+        layer did the right thing except this one, and no test passed m > 1.
+
+        Supported rather than rejected, because the part worth batching
+        already batches: one metadata round trip resolves the whole ``m * k``
+        result set where m separate calls would make m of them.
 
         When the corpus was built with ``center=True``, the stored corpus
         mean is automatically subtracted from the query before encoding.
         Callers do **not** need to center queries manually.
         """
-        if k <= 0:
-            return []
-
         query = np.asarray(query, dtype=self._quantizer.dtype)
+        if query.ndim > 2:
+            raise ValueError(
+                f"query must be 1-D (d,) or 2-D (m, d), got ndim={query.ndim}"
+            )
+        batched = query.ndim == 2
+        if k <= 0:
+            return [[] for _ in range(query.shape[0])] if batched else []
+
         if self._mean is not None:
             query = query - self._mean
 
         indices, distances = self._quantizer.search(
             query, self._codes, k=k, return_distances=True
         )
-        indices = np.asarray(indices)
-        distances = np.asarray(distances)
+        indices = np.atleast_2d(np.asarray(indices))
+        distances = np.atleast_2d(np.asarray(distances))
 
-        positions = indices.tolist()
-        if not positions:
-            return []
+        rows = indices.tolist()
+        dist_rows = distances.tolist()
+        # One round trip for the whole batch, not one per query.
+        flat = [pos for row in rows for pos in row]
+        if not flat:
+            return [[] for _ in rows] if batched else []
+        lookup = self._fetch_meta(flat)
 
-        lookup = self._fetch_meta(positions)
+        out: list[list[Result]] = []
+        for row, drow in zip(rows, dist_rows):
+            results: list[Result] = []
+            for rank, (pos, dist) in enumerate(zip(row, drow)):
+                record_id, meta = lookup.get(pos, (str(pos), None))
+                results.append(
+                    Result(
+                        rank=rank,
+                        distance=int(dist),
+                        record_id=record_id,
+                        meta=meta,
+                    )
+                )
+            out.append(results)
+        return out if batched else out[0]
 
-        results: list[Result] = []
-        for rank, (pos, dist) in enumerate(zip(positions, distances.tolist())):
-            record_id, meta = lookup.get(pos, (str(pos), None))
-            results.append(
-                Result(rank=rank, distance=int(dist), record_id=record_id, meta=meta)
+    # ------------------------------------------------------------------ #
+    # Metadata store
+    # ------------------------------------------------------------------ #
+    #
+    # _fetch_meta and lookup used to open a fresh sqlite3.connect on every
+    # call, so every search paid a connect + open + close for a database it
+    # had already opened. Pure overhead: the connection is read-only, keyed
+    # on nothing, and identical every time. Measured bare connect+close on
+    # this box is ~40-80 us — ~10% of a search at n=500/d=64, ~1% at
+    # n=10k/d=768 where the Hamming scan dominates. Small either way, but it
+    # buys nothing, and it scales with query count rather than corpus size.
+    #
+    # Connections are per-thread rather than one behind a lock: sqlite3
+    # objects are not safe to move between threads (hence check_same_thread),
+    # and one shared connection would serialise readers SQLite is happy to
+    # run concurrently. Thread-local costs one connect per thread that
+    # actually searches.
+    #
+    # mode=ro, not the previous mode=rw. Both refuse to conjure a fresh empty
+    # database if meta.db is removed underneath us (the CWE-367 hazard mode=rw
+    # was chosen for). Read-only additionally guarantees a long-lived
+    # connection can never sit on a write lock — which is the specific new
+    # risk of holding connections open instead of closing them.
+
+    def _connection(self) -> sqlite3.Connection:
+        """This thread's connection, opened on first use."""
+        if self._closed:
+            raise RuntimeError(
+                "Corpus is closed; construct a new Corpus(path) to search again"
             )
-        return results
+        con = getattr(self._local, "con", None)
+        if con is None:
+            con = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+            self._local.con = con
+            with self._conn_lock:
+                self._connections.append(con)
+        return con
+
+    def close(self) -> None:
+        """Close every connection this corpus opened, on every thread.
+
+        Idempotent. The corpus cannot be searched afterwards — construct a
+        new one. Connections do also close when the objects are collected,
+        but that is not a schedule to rely on: on Windows an open handle
+        blocks removing the corpus directory, which is what a test tmpdir
+        teardown tries to do.
+        """
+        self._closed = True
+        with self._conn_lock:
+            connections, self._connections = self._connections, []
+        for con in connections:
+            try:
+                con.close()
+            except sqlite3.Error:  # pragma: no cover - already-dead handle
+                pass
+        self._local = threading.local()
+
+    def __enter__(self) -> "Corpus":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def _fetch_meta(
         self, positions: Iterable[int]
@@ -503,39 +617,28 @@ class Corpus:
         if not positions:
             return out
 
-        # mode=rw: refuse silent creation of a fresh DB if meta.db has been
-        # deleted underneath us (CWE-367).
-        uri = f"file:{self._db_path}?mode=rw"
-        con = sqlite3.connect(uri, uri=True)
-        try:
-            for start in range(0, len(positions), _SQLITE_IN_CHUNK):
-                chunk = positions[start : start + _SQLITE_IN_CHUNK]
-                placeholders = ",".join("?" * len(chunk))
-                rows = con.execute(
-                    f"SELECT rowid, record_id, meta FROM corpus_meta "
-                    f"WHERE rowid IN ({placeholders})",
-                    chunk,
-                ).fetchall()
-                for rowid, record_id, meta_json in rows:
-                    out[rowid] = (
-                        record_id,
-                        json.loads(meta_json) if meta_json else None,
-                    )
-        finally:
-            con.close()
+        con = self._connection()
+        for start in range(0, len(positions), _SQLITE_IN_CHUNK):
+            chunk = positions[start : start + _SQLITE_IN_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = con.execute(
+                f"SELECT rowid, record_id, meta FROM corpus_meta "
+                f"WHERE rowid IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for rowid, record_id, meta_json in rows:
+                out[rowid] = (
+                    record_id,
+                    json.loads(meta_json) if meta_json else None,
+                )
         return out
 
     def lookup(self, record_id: str) -> int | None:
         """Reverse lookup: external record ID → array position."""
-        uri = f"file:{self._db_path}?mode=rw"
-        con = sqlite3.connect(uri, uri=True)
-        try:
-            row = con.execute(
-                "SELECT rowid FROM corpus_meta WHERE record_id = ? LIMIT 1",
-                (record_id,),
-            ).fetchone()
-        finally:
-            con.close()
+        row = self._connection().execute(
+            "SELECT rowid FROM corpus_meta WHERE record_id = ? LIMIT 1",
+            (record_id,),
+        ).fetchone()
         return int(row[0]) if row is not None else None
 
     @property
