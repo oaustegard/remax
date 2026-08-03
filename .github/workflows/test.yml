@@ -1,0 +1,86 @@
+name: tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Deliberately installs only `.[dev]` — never `.[bench]`. The bench extra
+  # pulls sentence-transformers (and therefore torch), which is hundreds of
+  # megabytes and has nothing to do with whether the library works.
+  pytest:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor pyproject's requires-python claims; 3.13 is the
+        # ceiling. Both edges are load-bearing — the middle rarely breaks alone.
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Report native availability
+        # The C extension compiles at first import. If it silently stopped
+        # compiling, tests still pass on the NumPy fallback and nobody notices,
+        # so print it rather than assert it (a runner without a compiler is a
+        # legitimate configuration).
+        run: python -c "import remax; print('NATIVE_AVAILABLE =', remax.NATIVE_AVAILABLE)"
+
+      - name: pytest
+        run: python -m pytest tests/ -q
+
+  gates:
+    name: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: rotation identity gate (must pass)
+        run: python bench/gates/rotation_identity_gate.py
+
+      # A gate seen only green has not been shown to work. Each gate ships a
+      # flag that reintroduces the defect it exists to catch; CI asserts the
+      # gate goes RED under it. If one of these steps starts passing, the gate
+      # has gone toothless and the green run above means nothing.
+      - name: rotation identity gate (must go RED on the pre-fix reader)
+        run: |
+          if python bench/gates/rotation_identity_gate.py --simulate-prefix; then
+            echo "::error::gate PASSED with the pre-fix reader patched in; it can no longer fail"
+            exit 1
+          fi
+          echo "gate went red as required"
+
+      - name: query path gate (must pass)
+        run: python bench/gates/query_path_gate.py
+
+      - name: query path gate (must go RED on each of its 8 simulated defects)
+        # --self-test re-invokes the gate once per defect and fails unless
+        # every one produces exit 1. This is the check on the gate itself.
+        run: python bench/gates/query_path_gate.py --self-test

@@ -7,12 +7,15 @@ Three primitives:
 * :func:`hamming_search` — top-k by Hamming distance for a single rotated query.
 
 When a C compiler is available, ``hamming_distances`` dispatches to a native
-kernel using hardware ``POPCNT`` (~50–60× faster than the NumPy LUT fallback).
+kernel using hardware ``POPCNT`` (~25–35× faster than the NumPy LUT fallback;
+the ratio depends on ``n`` and ``d`` — :mod:`remax._native` carries the table).
 The native path compiles automatically at first import and is cached; no extra
 dependencies are required.  See :mod:`remax._native` for details.
 """
 
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 
@@ -20,11 +23,97 @@ from . import _native
 
 __all__ = [
     "POPCOUNT_LUT",
+    "NonContiguousCodesWarning",
+    "as_codes",
     "encode_signs",
     "hamming_distances",
     "hamming_search",
     "stable_top_k",
 ]
+
+
+class NonContiguousCodesWarning(UserWarning):
+    """A code matrix had to be copied to be scanned.
+
+    Its own class so callers can escalate it (``warnings.simplefilter("error",
+    NonContiguousCodesWarning)``) or silence it deliberately, without touching
+    every other warning remax might raise.
+    """
+
+
+def as_codes(codes: np.ndarray, *, argname: str = "codes") -> np.ndarray:
+    """Validate a packed code matrix; copy only when unavoidable, and say so.
+
+    The single place a code matrix is checked. There used to be three —
+    ``core.SignBitQuantizer.search``, :func:`hamming_distances` and
+    ``_native.hamming_distances_native`` each opened with
+    ``np.ascontiguousarray(codes, dtype=np.uint8)``. On a well-formed index all
+    three are no-ops, so the redundancy cost nothing and looked harmless. On a
+    *strided view* it was three chances to copy the entire index, silently, on
+    a path that runs once per query — and a strided view is not an exotic
+    input. ``corpus.codes[::2]``, a subsampled evaluation set, a slice along
+    the wrong axis: all produce one.
+
+    Measured at 1M x 256 bits (32 MB): 5.6 ms contiguous, 16.6 ms through a
+    strided view, every millisecond of the difference invisible.
+
+    So: exactly one site may copy, and when it does it warns with the size.
+
+    Raises
+    ------
+    ValueError
+        If ``codes`` is not 2-D, or its dtype is not ``uint8``. A float or
+        int64 array here is a caller error — packed codes are bytes — and the
+        old silent ``dtype=np.uint8`` cast turned a wrong-array bug into wrong
+        distances rather than an exception.
+
+    Warns
+    -----
+    NonContiguousCodesWarning
+        If a copy was required. The array is still copied and the call still
+        succeeds; the point is that it stops being invisible.
+    """
+    arr = np.asarray(codes)
+    if arr.ndim != 2:
+        raise ValueError(f"{argname} must be 2-D, got ndim={arr.ndim}")
+    if arr.dtype != np.uint8:
+        raise ValueError(
+            f"{argname} must be uint8 (packed bits), got dtype={arr.dtype}. "
+            f"Encode with remax.encode_signs, or cast explicitly if you are "
+            f"sure this array already holds packed bytes."
+        )
+    if not arr.flags["C_CONTIGUOUS"]:
+        warnings.warn(
+            f"{argname} is not C-contiguous; copying "
+            f"{arr.nbytes / 1e6:.1f} MB to scan it. This happens on every "
+            f"call. Hoist the copy with np.ascontiguousarray(codes) once, "
+            f"outside your query loop.",
+            NonContiguousCodesWarning,
+            stacklevel=3,
+        )
+        arr = np.ascontiguousarray(arr)
+    return arr
+
+
+def _as_out(out: np.ndarray | None, n: int) -> np.ndarray:
+    """Validate a caller-supplied output buffer, or allocate one."""
+    if out is None:
+        return np.empty(n, dtype=np.int32)
+    if not isinstance(out, np.ndarray):
+        raise TypeError(f"out must be a numpy array, got {type(out).__name__}")
+    if out.shape != (n,):
+        raise ValueError(
+            f"out has shape {out.shape}; expected ({n},) to match the corpus"
+        )
+    if out.dtype != np.int32:
+        raise ValueError(
+            f"out must be int32 (the distance dtype), got {out.dtype}"
+        )
+    if not out.flags["C_CONTIGUOUS"]:
+        raise ValueError("out must be C-contiguous")
+    if not out.flags["WRITEABLE"]:
+        raise ValueError("out must be writeable")
+    return out
 
 # 256-entry byte-popcount lookup. uint16 is plenty (max value 8 per byte).
 POPCOUNT_LUT: np.ndarray = np.array(
@@ -68,16 +157,26 @@ def encode_signs(X_rotated: np.ndarray) -> np.ndarray:
 
 
 def hamming_distances(
-    codes: np.ndarray, query_code: np.ndarray
+    codes: np.ndarray, query_code: np.ndarray, *, out: np.ndarray | None = None
 ) -> np.ndarray:
     """Hamming distance from ``query_code`` to every row of ``codes``.
 
     Parameters
     ----------
     codes : np.ndarray, shape (n, B), dtype uint8
-        Bit-packed corpus.
+        Bit-packed corpus. Must be C-contiguous uint8; see :func:`as_codes`
+        for what happens when it is not.
     query_code : np.ndarray, shape (B,), dtype uint8
         Bit-packed query.
+    out : np.ndarray, shape (n,), dtype int32, keyword-only
+        Destination buffer. When given, distances are written into it and it
+        is returned, so a caller looping over queries allocates one ``(n,)``
+        int32 array instead of one per query — at n=1M that is 4 MB of
+        allocate-and-free per query. Omitting it preserves the previous
+        behaviour exactly (a fresh array each call).
+
+        The buffer is fully overwritten every call, so stale values from a
+        previous query cannot survive into the next.
 
     Returns
     -------
@@ -87,21 +186,20 @@ def hamming_distances(
         and keeps the downstream top-k argpartition narrow; ``search`` widens
         the returned top-k slice back to int64 for its public contract.
     """
-    codes = np.ascontiguousarray(codes, dtype=np.uint8)
+    codes = as_codes(codes)
     q = np.ascontiguousarray(query_code, dtype=np.uint8)
-    if codes.ndim != 2:
-        raise ValueError(f"codes must be 2-D, got ndim={codes.ndim}")
     if q.ndim != 1 or q.shape[0] != codes.shape[1]:
         raise ValueError(
             f"query_code shape {q.shape} incompatible with "
             f"codes shape {codes.shape}"
         )
+    out = _as_out(out, codes.shape[0])
     if _native.AVAILABLE:
-        return _native.hamming_distances_native(codes, q)
+        return _native.hamming_distances_native(codes, q, out=out)
     xor = np.bitwise_xor(codes, q[None, :])
     # POPCOUNT_LUT[xor] is (n, B) uint16 — popcount per byte. Sum across
     # bytes gives total Hamming distance per row.
-    return POPCOUNT_LUT[xor].sum(axis=1, dtype=np.int32)
+    return POPCOUNT_LUT[xor].sum(axis=1, dtype=np.int32, out=out)
 
 
 def stable_top_k(dists: np.ndarray, k: int) -> np.ndarray:

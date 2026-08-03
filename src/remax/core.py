@@ -31,6 +31,7 @@ import numpy as np
 # Re-export the functional API at this layer so callers can import either
 # ``from remax.core import haar_rotation`` or ``from remax import haar_rotation``.
 from .packing import (
+    as_codes,
     asymmetric_scores,
     asymmetric_search,
     encode_signs,
@@ -218,12 +219,21 @@ class SignBitQuantizer:
             raise ValueError(
                 f"query has {query.shape[1]} columns; expected {self.d}."
             )
-        codes = np.ascontiguousarray(codes, dtype=np.uint8)
-        if codes.ndim != 2 or codes.shape[1] != self.d // 8:
+        # Shape first, then as_codes. Reversing these would emit a
+        # "copying N MB" warning for a codes array that is about to be
+        # rejected as the wrong width anyway — a slice like codes[:, :-1] is
+        # both non-contiguous and wrong, and the useful message is the second.
+        _codes = np.asarray(codes)
+        if _codes.ndim != 2 or _codes.shape[1] != self.d // 8:
             raise ValueError(
-                f"codes shape {codes.shape} incompatible with d={self.d} "
+                f"codes shape {_codes.shape} incompatible with d={self.d} "
                 f"(expected (n, {self.d // 8}))."
             )
+        # Validated once here, and once only: as_codes is the single site in
+        # the library allowed to copy a code matrix, and it warns when it
+        # does. hamming_distances re-checks (cheaply — no copy is possible on
+        # an already-good array) because it is public in its own right.
+        codes = as_codes(_codes)
 
         rotated = query @ self.rotation_
         q_codes = encode_signs(rotated)  # (m, d//8)
@@ -237,8 +247,14 @@ class SignBitQuantizer:
         # Per-query loop — fine for v0.1.0 (O(m·n·B) work either way, and
         # the SIMD popcount kernel that would justify full vectorisation
         # is explicitly post-v0.1.0).
+        #
+        # One (n,) int32 scratch buffer for the whole batch instead of one per
+        # query: at n=1M that is 4 MB allocated and freed per query. The
+        # kernel writes every element on every call, so query i cannot read
+        # anything left behind by query i-1.
+        dists = np.empty(n, dtype=np.int32)
         for i in range(m):
-            dists = hamming_distances(codes, q_codes[i])
+            hamming_distances(codes, q_codes[i], out=dists)
             order = stable_top_k(dists, k_eff)
             out_idx[i] = order
             out_dist[i] = dists[order]

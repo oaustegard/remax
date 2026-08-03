@@ -10,7 +10,8 @@ comparison with data-oblivious remax; it's a stronger baseline that costs a fit 
 Data sources (embedding caches + qrels/gold):
   - $SCRATCH/emb/{scifact_docs,scifact_queries,stsb_s1,stsb_s2}.npy
   - $SCRATCH/data/{scifact_subset,stsb_test}.json
-where $SCRATCH = /tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad
+where $SCRATCH resolves via bench/nemotron_paths.py:
+  $NEMOTRON_SCRATCH, else $SCRATCH, else bench/.cache/nemotron
 
 Outputs:
   - /home/user/remax/bench/results/nemotron_baselines.csv
@@ -50,9 +51,10 @@ except ImportError:
     print("ERROR: faiss not installed. Install with: pip install faiss-cpu", file=sys.stderr)
     sys.exit(1)
 
-SCRATCH = Path(
-    "/tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad"
-)
+# Cache paths come from bench/nemotron_paths.py so every nemotron script
+# resolves them the same way and all of them honour NEMOTRON_SCRATCH.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nemotron_paths import DATA_DIR, EMB_DIR, RESULTS_DIR, SCRATCH  # noqa: E402
 
 # Target byte budgets (from contract)
 TARGET_BYTES = [1024, 512, 256, 128, 64, 32]

@@ -128,6 +128,56 @@ k=10, best of 5 (`nemotron_latency.csv`):
 | bit1_2048 | remax | 256 | **0.39** | 0.042 | 23,325 |
 | bit1_stack4 | remax | 1024 | 1.56 | 0.155 | 6,428 |
 
+> ### ⚠️ The table above came from a harness that did not treat the arms alike
+>
+> **Corrected 2026-08-03.** Do not compare those per-query columns across
+> families. `bench/latency_nemotron.py` handed the float32 baseline three
+> advantages that belong to the harness, not to either algorithm:
+>
+> | | float32 arm | remax arm |
+> |---|---|---|
+> | scoring | `queries @ corpus.T` — **one** batched GEMM over all 300 | a Python loop, **300** calls to `hamming_distances` |
+> | top-k | `np.argsort(-scores, axis=1)[:, :k]` — one batched call | `np.argsort(distances)[:k]` — a full O(n log n) sort, **per query** |
+> | selector | numpy's own | **not** `stable_top_k`, the O(n) argpartition selector remax ships |
+>
+> The batched GEMM amortises Python and dispatch overhead across 300 queries
+> and lets BLAS keep the corpus blocked in cache. The per-query loop rereads
+> the index 300 times and pays dispatch 300 times. The two columns are not
+> measuring comparable things, and the mismatch runs one way.
+>
+> Measured at the published shape (n = 5,183, d = 2,048, m = 300, k = 10,
+> single-threaded, best of 5) on synthetic vectors — re-running the real arms
+> needs the embedding cache:
+>
+> | arm | ms/query |
+> |---|--:|
+> | float32, batched GEMM | 0.311 |
+> | float32, per-query | 4.033 |
+> | remax 1-bit | 0.196 |
+> | remax stacked k=4 | 0.690 |
+>
+> The batching axis alone is worth **13×** to float32. Against a like-for-like
+> per-query float32 baseline, remax 1-bit is **20.6× faster**; against a
+> *batched* float32 baseline it is **1.6×**. Both are real, and they answer
+> different questions — "which is the faster scan" versus "can I beat BLAS at
+> what BLAS is best at". Only the second was ever reported, and it was
+> reported without saying which one it was.
+>
+> Denying remax its own selector was separately worth ~18% (0.255 → 0.210
+> ms/query once `stable_top_k` and an `out=` buffer replace `np.argsort` and a
+> per-query allocation).
+>
+> One caveat that runs the *other* way, for completeness: query encoding
+> (`query @ R`) sits outside the timed region for remax, as it did
+> originally. float32 has no encode step, so that exclusion favours remax.
+>
+> `mode` is now an explicit axis in the harness and both arms use an O(n)
+> selector. The remax arm documents that it has **no batched Hamming kernel**
+> rather than manufacturing one: `search` loops in Python however it is
+> called, and an m-way SIMD popcount is explicitly post-v0.1.0. Regenerating
+> this table against the real cache is the remaining work — the numbers above
+> are the harness correction, not a replacement measurement.
+
 **Honest reading of latency**: at n = 1,600 the corpus is far too small for
 scan *speed* to be remax's win — a BLAS float32 matmul over 1,600 vectors is
 already sub-40 µs, and the pure-numpy popcount Hamming scan is in the same
@@ -136,6 +186,11 @@ ballpark (stacked k=4 is actually slower). remax's decisive advantage here is
 where a packed Hamming scan beats a bandwidth-bound float scan lives at much
 larger n — that is exactly remex's `IVFCoarseIndex` territory, out of scope for
 this experiment.
+
+That conclusion survives the correction — index size, not scan speed, is what
+this experiment supports — but it was reached from numbers that understated
+remax's per-query scan by roughly 13×. It was right for reasons only partly
+connected to the evidence offered for it.
 
 ## Reading
 

@@ -10,11 +10,18 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [{name = "Oskar Austegard"}]
-dependencies = ["numpy>=1.24", "scipy>=1.10"]
+# Runtime deps are exactly what src/remax/ imports. scipy used to be pinned
+# here, but nothing under src/remax/ imports it — only tests/ and six bench
+# scripts do (all of them `scipy.stats`), so it lives in the dev/bench extras
+# now. This does NOT shrink the dependency surface of anything downstream that
+# needs scipy for other reasons (remax_kb pins it directly *and* pulls it in
+# transitively via bm25s). The justification is narrower: remax should not
+# force a dependency it never imports.
+dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov"]
-bench = ["sentence-transformers", "matplotlib", "remex>=0.5.1"]
+dev = ["pytest>=7.0", "pytest-cov", "scipy>=1.10"]
+bench = ["sentence-transformers", "matplotlib", "remex>=0.5.1", "scipy>=1.10"]
 rerank = ["onnxruntime", "tokenizers", "huggingface_hub"]
 
 [tool.setuptools.packages.find]

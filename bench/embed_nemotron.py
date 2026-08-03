@@ -34,9 +34,10 @@ from pathlib import Path
 import numpy as np
 
 
-SCRATCH = Path(os.environ.get("SCRATCH", "/tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad"))
-DATA_DIR = SCRATCH / "data"
-EMB_DIR = SCRATCH / "emb"
+# Cache paths come from bench/nemotron_paths.py so every nemotron script
+# resolves them the same way and all of them honour NEMOTRON_SCRATCH.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nemotron_paths import DATA_DIR, EMB_DIR, RESULTS_DIR, SCRATCH  # noqa: E402
 PARTS_DIR = EMB_DIR / "parts"
 
 MODEL_ID = "nvidia/Nemotron-3-Embed-1B-BF16"

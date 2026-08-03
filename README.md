@@ -28,7 +28,7 @@ Future work is tracked in [issues](https://github.com/oaustegard/remax/issues). 
 - `Corpus` — packed binary codes + SQLite metadata sidecar. Maps array indices to record IDs with JSON metadata per record. [Postgres recipe](docs/postgres-recipe.md) included.
 - `characterize()` — sweep a strategy × k grid on your encoder and get a recommended operating point.
 - Rotation choice — `rotation="haar"` (default, Haar-distributed QR) or `rotation="rht"` (randomized Hadamard, 1.5–1.8× faster to build). Measured equivalent for retrieval; see [`ROTATION_LSH.md`](bench/results/ROTATION_LSH.md) for why a structured rotation needed re-measuring here rather than inheriting remex's result, and for the single-round construction it rules out.
-- Native Hamming scan — C extension compiled at first import with hardware POPCNT. 23× over NumPy (9.7 GB/s effective throughput, within 1.3× of memcpy ceiling).
+- Native Hamming scan — C extension compiled at first import with hardware POPCNT. **25–35× over the NumPy LUT fallback**, 5–11 GB/s effective throughput. The ratio depends on `n` and `d` — 33× at n=1M/d=768, 28× at n=1M/d=256 — because the NumPy path materialises a uint16 gather ~3× the size of the index while the native path streams it once. Throughput drops from ~10 GB/s to ~7 GB/s between n=100k and n=1M, where the index outgrows last-level cache. Measured on an Intel Xeon @ 2.80 GHz; reproduce with `python3 bench/native_speedup.py`.
 
 **Benchmark suite** (`bench/`):
 - [`BASELINE.md`](bench/results/BASELINE.md) — R@10 vs float32 ground truth across the stacked precision ladder. 1-bit: 0.635, k=2: 0.676, k=4: 0.706, k=8: 0.718.
@@ -45,28 +45,45 @@ Future work is tracked in [issues](https://github.com/oaustegard/remax/issues). 
 pip install -e .
 ```
 
+Every `python` block in this file is executed verbatim by
+`tests/test_readme.py`, so what follows runs as written — swap in your own
+embeddings for the synthetic ones.
+
 ```python
 import numpy as np
 import remax
 
-# Encode
+rng = np.random.default_rng(0)
+embeddings = rng.standard_normal((1000, 768), dtype=np.float32)
+query = rng.standard_normal(768, dtype=np.float32)
+paper_ids = [f"paper-{i}" for i in range(len(embeddings))]
+
+# Encode: 768 float32 dims (3 KB/vector) → 96 packed bytes
 q = remax.SignBitQuantizer(d=768, seed=42)
-codes = q.encode(embeddings)          # (n, 96) uint8
+codes = q.encode(embeddings)                     # (1000, 96) uint8
 
-# Search
-dists = remax.hamming_distances(q.encode(query), codes)
-top_k = np.argsort(dists[0])[:10]
+# Search: top-k by Hamming distance
+top_k, dists = q.search(query, codes, k=10, return_distances=True)
 
-# Stacked precision ladder
+# The functional API underneath, when you want the whole distance vector.
+# Corpus first, query second — and the result is 1-D over the corpus.
+all_dists = remax.hamming_distances(codes, q.encode(query))   # (1000,) int32
+
+# Stacked precision ladder: k independent rotations, k bits per dimension
 sq = remax.StackedSignBitQuantizer(d=768, k=4, seed=42)
-codes = sq.encode(embeddings)         # (n, 384) uint8 — 4× wider, rank-correct
-dists = sq.hamming_distances(sq.encode(query), codes)
+stacked_codes = sq.encode(embeddings)            # (1000, 384) uint8 — 4× wider
+stacked_top_k = sq.search(query, stacked_codes, k=10)
 
-# Corpus with metadata
-corpus = remax.Corpus.create("papers.bin", embeddings, sq,
-                              record_ids=paper_ids,
-                              metadata=[{"title": t} for t in titles])
-results = corpus.search(query_embedding, k=10)  # List[Result]
+# Corpus with metadata. build() takes a *directory*, not a file, and
+# quantizes internally — it does not accept a quantizer.
+corpus = remax.Corpus.build(
+    "papers/", embeddings, paper_ids,
+    seed=42,
+    meta=[{"title": f"Paper {i}"} for i in range(len(embeddings))],
+    center=True,          # stores the corpus mean; search() re-applies it
+)
+results = corpus.search(query, k=10)             # list[Result]
+print(results[0].rank, results[0].record_id, results[0].distance, results[0].meta)
 ```
 
 Native POPCNT acceleration is automatic when available (check `remax.NATIVE_AVAILABLE`).

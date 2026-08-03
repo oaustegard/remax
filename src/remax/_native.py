@@ -25,8 +25,40 @@ a partially written library (CWE-367).
 Performance
 -----------
 On x86-64 with hardware ``POPCNT`` (any CPU from ~2008 onward), the native
-scan achieves ~10 GB/s effective throughput — roughly 50–60× faster than
-the NumPy LUT path, and within a factor of 2 of raw ``memcpy`` bandwidth.
+scan runs **roughly 25-35x faster than the NumPy LUT fallback**, at 5-11 GB/s
+effective throughput (index bytes scanned / elapsed).
+
+It is not a single number, and quoting it as one is what produced the two
+mutually exclusive figures this docstring and README.md used to carry
+("50-60x" here, "23x / 9.7 GB/s" there). The ratio moves with both ``n`` and
+``d``, because the two paths have different memory behaviour: the NumPy path
+materialises an ``(n, B)`` uint16 gather -- 2 bytes of intermediate per input
+byte, so it touches ~3x the index and leaves cache early -- while the native
+path streams the index once and writes 4 bytes per row.
+
+Measured on an Intel Xeon @ 2.80 GHz, numpy 2.4, min of 9 runs
+(``bench/native_speedup.py``):
+
+    ==========  ========  ========  ============
+    n           d=768     d=256     GB/s (d=768)
+    ==========  ========  ========  ============
+    10,000      32.9x     24.9x     10.8
+    100,000     34.9x     32.2x     10.0
+    1,000,000   33.5x     27.7x      6.8
+    ==========  ========  ========  ============
+
+Throughput falls off between 100k and 1M because that is where the index
+stops fitting in last-level cache; past that point the scan is bandwidth-
+bound, which is the regime the design targets.
+
+The old "within a factor of 2 of raw memcpy bandwidth" line is gone rather
+than restated. It compared unlike traffic: memcpy moves ``2*n*B`` bytes
+(read and write) where this scan reads ``n*B`` and writes ``4n``, so the
+comparison can be made to say almost anything. ``bench/native_speedup.py``
+still prints a memcpy column, labelled as a scale reference, not headroom.
+
+Reproduce with ``python3 bench/native_speedup.py [--d D] [--sizes N ...]``.
+These are hardware-specific; re-measure before quoting them elsewhere.
 """
 
 from __future__ import annotations
@@ -243,20 +275,44 @@ AVAILABLE: bool = _lib is not None
 
 
 def hamming_distances_native(
-    codes: np.ndarray, query_code: np.ndarray
+    codes: np.ndarray, query_code: np.ndarray, *, out: np.ndarray | None = None
 ) -> np.ndarray:
-    """Hamming distance from query_code to every row of codes."""
+    """Hamming distance from query_code to every row of codes.
+
+    ``out``, when given, is an ``(n,)`` int32 C-contiguous buffer written in
+    place and returned. The kernel assigns every element (``out[i] = dist``),
+    so nothing from a previous call survives.
+
+    This function no longer copies ``codes``. It used to open with
+    ``np.ascontiguousarray(codes, dtype=np.uint8)`` — the third such call on
+    a path that already had two, and the one in the worst position, because
+    it sits inside the per-query loop. A non-contiguous array is now a
+    ``ValueError`` here rather than a silent whole-index copy: the public
+    entry point (:func:`remax.packing.as_codes`) is where a copy may happen,
+    once, with a warning. Passing a raw pointer to a strided buffer would
+    read garbage, so this check is load-bearing, not defensive.
+    """
     if _lib is None:
         raise RuntimeError(
             "Native scan not available; check remax._native.AVAILABLE "
             "before calling."
         )
 
-    codes = np.ascontiguousarray(codes, dtype=np.uint8)
     query_code = np.ascontiguousarray(query_code, dtype=np.uint8)
 
+    if not isinstance(codes, np.ndarray):
+        raise ValueError(f"codes must be a numpy array, got {type(codes).__name__}")
     if codes.ndim != 2:
         raise ValueError(f"codes must be 2-D, got ndim={codes.ndim}")
+    if codes.dtype != np.uint8:
+        raise ValueError(f"codes must be uint8, got dtype={codes.dtype}")
+    if not codes.flags["C_CONTIGUOUS"]:
+        raise ValueError(
+            "codes must be C-contiguous; the native kernel reads a raw "
+            "pointer and a strided buffer would give wrong distances. Pass "
+            "it through remax.packing.as_codes (or np.ascontiguousarray) "
+            "first — once, outside your query loop."
+        )
     if query_code.ndim != 1:
         raise ValueError(f"query_code must be 1-D, got ndim={query_code.ndim}")
     if query_code.shape[0] != codes.shape[1]:
@@ -266,7 +322,17 @@ def hamming_distances_native(
         )
 
     n, B = codes.shape
-    out = np.empty(n, dtype=np.int32)
+    if out is None:
+        out = np.empty(n, dtype=np.int32)
+    else:
+        if out.shape != (n,):
+            raise ValueError(f"out has shape {out.shape}; expected ({n},)")
+        if out.dtype != np.int32:
+            raise ValueError(f"out must be int32, got {out.dtype}")
+        if not out.flags["C_CONTIGUOUS"]:
+            raise ValueError("out must be C-contiguous")
+        if not out.flags["WRITEABLE"]:
+            raise ValueError("out must be writeable")
 
     _lib.hamming_scan(
         codes.ctypes.data,
