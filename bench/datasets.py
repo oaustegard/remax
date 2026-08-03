@@ -48,7 +48,7 @@ __all__ = [
 def _default_cache_root() -> Path:
     """Locate the in-repo ``bench/.cache/`` directory.
 
-    The package source lives at ``<repo>/src/remax/bench/datasets.py`` in an
+    The package source lives at ``<repo>/src/bench/datasets.py`` in an
     editable install, so the repo root is ``parents[3]``. If that path does
     not look like a remax checkout (e.g. in a wheel install on PyPI), fall
     back to a package-local ``.cache/`` so loads still work, just with a
@@ -64,7 +64,7 @@ def _default_cache_root() -> Path:
         return Path(env).expanduser().resolve()
 
     here = Path(__file__).resolve()
-    # src/remax/bench/datasets.py → parents[3] = repo root
+    # src/bench/datasets.py → parents[3] = repo root
     if len(here.parents) >= 4:
         candidate = here.parents[3] / "bench" / ".cache"
         # Trust the candidate iff a sibling pyproject.toml exists; otherwise

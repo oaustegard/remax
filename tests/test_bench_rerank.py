@@ -1,4 +1,4 @@
-"""Tests for ``remax.bench.rerank`` — float32-IP and cross-encoder rerankers.
+"""Tests for ``bench.rerank`` — float32-IP and cross-encoder rerankers.
 
 The cross-encoder path is exercised with a stub session/tokenizer so the
 tests don't download a model and don't require ``onnxruntime`` /
@@ -12,8 +12,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from remax.bench import rerank
-from remax.bench.rerank import (
+from bench import rerank
+from bench.rerank import (
     CrossEncoderReranker,
     DEFAULT_CROSS_ENCODER,
     float32_ip_rerank,

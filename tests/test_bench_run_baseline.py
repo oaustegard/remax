@@ -1,4 +1,4 @@
-"""Tests for ``remax.bench.run_baseline`` — orchestrator + markdown formatter.
+"""Tests for ``bench.run_baseline`` — orchestrator + markdown formatter.
 
 The CLI driver itself is smoke-tested elsewhere; the testable seams are:
 
@@ -15,7 +15,7 @@ import re
 import numpy as np
 import pytest
 
-from remax.bench.run_baseline import (
+from bench.run_baseline import (
     compute_baseline_for_embeddings,
     format_baseline_md,
     LADDER_KS,
@@ -137,7 +137,7 @@ def test_compute_baseline_centering_uses_corpus_mean_not_full_mean():
     # Shift the query rows so that corpus_mean != full_mean by a non-trivial
     # amount. The exact identity of which rows become queries depends on the
     # internal split RNG (QUERY_SPLIT_SEED=99, so we can construct it).
-    from remax.bench.run_baseline import QUERY_SPLIT_SEED
+    from bench.run_baseline import QUERY_SPLIT_SEED
     perm = np.random.default_rng(QUERY_SPLIT_SEED).permutation(emb.shape[0])
     query_rows = perm[:30]
     emb[query_rows] += 5.0  # all-axis shift, forces full_mean ≠ corpus_mean
@@ -148,7 +148,7 @@ def test_compute_baseline_centering_uses_corpus_mean_not_full_mean():
 
     # Hand-roll the centered-by-corpus-mean baseline and compare.
     from remax import SignBitQuantizer
-    from remax.bench.eval import exact_knn, recall_at_k
+    from bench.eval import exact_knn, recall_at_k
     queries = emb[query_rows]
     corpus = emb[perm[30:]]
     truth = exact_knn(corpus, queries, k=10)

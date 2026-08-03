@@ -1,4 +1,4 @@
-"""Tests for ``remax.bench.crossover`` — issue #5 publication artifact.
+"""Tests for ``bench.crossover`` — issue #5 publication artifact.
 
 The testable seams here are:
 
@@ -26,7 +26,7 @@ import pytest
 pytest.importorskip("remex")
 pytest.importorskip("matplotlib")
 
-from remax.bench.crossover import (
+from bench.crossover import (
     BITS_PER_DIM_LADDER,
     CrossoverPoint,
     METHOD_REMAX,
@@ -224,7 +224,7 @@ def test_format_crossover_md_links_to_csv_and_png():
 
 
 def test_format_crossover_md_renders_sanity_table():
-    from remax.bench.crossover import SanityResult
+    from bench.crossover import SanityResult
     sanity = [SanityResult("SPECTER2", remax=0.635, remex=0.607, delta=0.028, tol=0.05)]
     md = format_crossover_md(
         points=_two_dataset_points(), sanity=sanity,
