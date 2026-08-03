@@ -30,6 +30,31 @@ Codes follow as ``n * (d // 8)`` bytes of packed signs.
 
 A v0 reader (no magic, 25-byte header) is supported in :meth:`Corpus.__init__`
 so older indexes still load with a deprecation warning.
+
+Sidecar files
+-------------
+Anything the header cannot carry lives beside it in the corpus directory, the
+idiom ``mean.npy`` already established:
+
+``mean.npy``
+    Corpus mean, written by ``build(center=True)``.
+``rotation.json``
+    ``{"rotation": "haar"|"rht"}`` — which rotation construction encoded the
+    codes. The two constructions produce different codes from the same
+    ``(d, seed)``, so a reader that guesses wrong decodes queries into the
+    wrong frame and returns silently-degraded neighbours.
+
+    **An absent ``rotation.json`` means Haar**, always — never "whatever the
+    library default happens to be now". Every index built before this file
+    existed was built with the Haar construction, so that is the only reading
+    that keeps them decoding as they were written. Resolving the absent case
+    against a live module default would mean flipping that default silently
+    reinterprets every stored corpus, which is exactly the hazard this sidecar
+    exists to remove (see ``bench/results/ROTATION_LSH.md``).
+
+Sidecars keep this a two-way door: the binary header is untouched and
+``_VERSION`` does not move, so an older build ignores the extra file and reads
+the index exactly as before.
 """
 
 from __future__ import annotations
@@ -45,12 +70,24 @@ from typing import Any, Iterable, Iterator, Optional
 import numpy as np
 
 from .core import SignBitQuantizer
+from .rotation import ROTATIONS
 
 __all__ = ["Corpus", "Result"]
 
 _BIN_NAME = "index.bin"
 _DB_NAME = "meta.db"
 _MEAN_NAME = "mean.npy"
+_ROTATION_NAME = "rotation.json"
+
+#: What an absent ``rotation.json`` means. This is a **frozen historical
+#: fact**, not a default: every corpus written before the sidecar existed was
+#: encoded with the Haar construction, and it stays readable only if that is
+#: what we assume. Deliberately a literal rather than
+#: ``SignBitQuantizer``'s ``rotation`` default — binding it to the live
+#: default would make flipping that default silently reinterpret every
+#: already-stored corpus, which is the failure this sidecar was added to
+#: prevent. Do not "simplify" it into an inherited default.
+_LEGACY_ROTATION = "haar"
 
 # Format constants
 _MAGIC = b"RMAX"
@@ -146,6 +183,53 @@ def _write_header(n: int, d: int, seed: int | None) -> bytes:
     return bytes(buf)
 
 
+def _validate_rotation(kind: str) -> str:
+    """Reject a rotation name the quantizer could not build."""
+    if kind not in ROTATIONS:
+        raise ValueError(
+            f"unknown rotation {kind!r}; expected one of {sorted(ROTATIONS)}."
+        )
+    return kind
+
+
+def _read_rotation(path: Path) -> str:
+    """Resolve the rotation a stored corpus was encoded with.
+
+    ``path`` is the corpus directory. A missing ``rotation.json`` resolves to
+    :data:`_LEGACY_ROTATION`, never to the quantizer's current default — see
+    the module docstring.
+    """
+    sidecar = path / _ROTATION_NAME
+    if not sidecar.exists():
+        return _LEGACY_ROTATION
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"corrupt {_ROTATION_NAME} in {path}: {e}") from None
+    if not isinstance(payload, dict) or "rotation" not in payload:
+        raise ValueError(
+            f"corrupt {_ROTATION_NAME} in {path}: expected an object with a "
+            f"'rotation' key, got {payload!r}"
+        )
+    kind = payload["rotation"]
+    if not isinstance(kind, str):
+        raise ValueError(
+            f"corrupt {_ROTATION_NAME} in {path}: rotation must be a string, "
+            f"got {kind!r}"
+        )
+    return _validate_rotation(kind)
+
+
+def _write_rotation(path: Path, kind: str) -> None:
+    """Persist the rotation construction beside the index."""
+    sidecar = path / _ROTATION_NAME
+    sidecar.write_text(json.dumps({"rotation": kind}) + "\n", encoding="utf-8")
+    try:
+        os.chmod(sidecar, 0o600)
+    except OSError:
+        pass
+
+
 def _meta_rows(
     ids: list[str], meta: list[dict] | None
 ) -> Iterator[tuple[int, str, str | None]]:
@@ -181,6 +265,13 @@ class Corpus:
             match queries against corpora that were built before the
             f32-default change if you want bit-exact query encoding;
             recall is statistically identical either way.
+
+        Notes
+        -----
+        The rotation construction is read from the ``rotation.json``
+        sidecar and is not overridable here: it is a property of the
+        stored codes, not of the reader. Corpora written before the
+        sidecar existed resolve to ``"haar"``.
         """
         self._dir = Path(path)
         bin_path = self._dir / _BIN_NAME
@@ -220,7 +311,10 @@ class Corpus:
 
         codes_flat = raw[payload_off : payload_off + codes_bytes]
         self._codes = codes_flat.reshape(n, d // 8)
-        q_kwargs: dict = {"d": d, "seed": seed}
+        # Always passed explicitly: the stored corpus decides, not the
+        # quantizer's current default.
+        self._rotation = _read_rotation(self._dir)
+        q_kwargs: dict = {"d": d, "seed": seed, "rotation": self._rotation}
         if dtype is not None:
             q_kwargs["dtype"] = dtype
         self._quantizer = SignBitQuantizer(**q_kwargs)
@@ -253,13 +347,21 @@ class Corpus:
         meta: list[dict] | None = None,
         center: bool = False,
         dtype: np.dtype | type | None = None,
+        rotation: str = _LEGACY_ROTATION,
     ) -> "Corpus":
         """Build a corpus from raw vectors and record IDs.
 
         ``dtype`` controls the quantizer's working precision; ``None``
         uses the :class:`SignBitQuantizer` default. Centering, when
         enabled, is computed in the input dtype before encoding.
+
+        ``rotation`` selects the rotation construction (``"haar"`` or
+        ``"rht"``) and is recorded in the ``rotation.json`` sidecar so
+        :meth:`__init__` reconstructs the same one. The two constructions
+        give different codes from the same ``(d, seed)``; codes are not
+        interchangeable between them.
         """
+        _validate_rotation(rotation)
         vectors = np.asarray(vectors)
         if vectors.ndim != 2:
             raise ValueError(f"vectors must be 2-D, got shape {vectors.shape}")
@@ -291,7 +393,7 @@ class Corpus:
         except OSError:
             pass
 
-        q_kwargs: dict = {"d": d, "seed": seed}
+        q_kwargs: dict = {"d": d, "seed": seed, "rotation": rotation}
         if dtype is not None:
             q_kwargs["dtype"] = dtype
         q = SignBitQuantizer(**q_kwargs)
@@ -312,6 +414,12 @@ class Corpus:
             os.chmod(bin_path, 0o600)
         except OSError:
             pass
+
+        # Record which rotation encoded these codes. Written unconditionally,
+        # including for "haar": the file's presence is what lets a later
+        # reader distinguish "built as haar" from "built before we recorded
+        # it" — and both must decode as haar.
+        _write_rotation(dest, rotation)
 
         # Persist the corpus mean so search() can auto-center queries.
         # Mean is saved in input dtype so the round-trip is bit-exact for
@@ -455,6 +563,22 @@ class Corpus:
         """Whether this corpus was built with ``center=True``."""
         return self._mean is not None
 
+    @property
+    def rotation(self) -> str:
+        """Rotation construction these codes were encoded with.
+
+        Read-only: it describes the bytes on disk. ``"haar"`` for a corpus
+        with no ``rotation.json`` sidecar, whatever the library default is
+        at read time.
+        """
+        return self._rotation
+
     def __repr__(self) -> str:
         c = ", centered" if self.centered else ""
-        return f"Corpus(n={self.n}, d={self.d}{c}, path={str(self._dir)!r})"
+        # haar is the historical reading; only the unusual case is worth ink.
+        r = (
+            ""
+            if self._rotation == _LEGACY_ROTATION
+            else f", rotation={self._rotation!r}"
+        )
+        return f"Corpus(n={self.n}, d={self.d}{c}{r}, path={str(self._dir)!r})"

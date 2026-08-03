@@ -351,3 +351,157 @@ def test_center_false_overwrites_mean():
         # Rebuild without centering
         _make_corpus(tmpdir)
         assert not (Path(tmpdir) / "mean.npy").exists()
+
+
+# --------------------------------------------------------------------- #
+# 8. Rotation sidecar (rotation.json)
+#
+# The two rotation constructions give different codes from the same
+# (d, seed). Nothing in the binary header records which one wrote a
+# corpus, so the rotation is persisted in a sidecar file. The load-bearing
+# case is the ABSENT one: an index written before the sidecar existed must
+# keep decoding as haar no matter what the library default becomes.
+# --------------------------------------------------------------------- #
+
+def test_build_writes_rotation_sidecar():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_corpus(tmpdir)
+        sidecar = Path(tmpdir) / "rotation.json"
+        assert sidecar.exists()
+        assert json.loads(sidecar.read_text()) == {"rotation": "haar"}
+
+
+def test_build_records_rht():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rng = np.random.default_rng(0)
+        vectors = rng.standard_normal((30, 64))
+        ids = [f"doc-{i}" for i in range(30)]
+        c = Corpus.build(tmpdir, vectors, ids, seed=1, rotation="rht")
+        assert c.rotation == "rht"
+        assert json.loads((Path(tmpdir) / "rotation.json").read_text()) == {
+            "rotation": "rht"
+        }
+        assert Corpus(tmpdir).rotation == "rht"
+
+
+def test_rotation_defaults_to_haar():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c, _, _ = _make_corpus(tmpdir)
+        assert c.rotation == "haar"
+
+
+def test_absent_sidecar_means_haar_even_if_default_flips():
+    """A pre-sidecar index decodes as haar regardless of the library default.
+
+    This is the whole point of the sidecar: flipping ``SignBitQuantizer``'s
+    ``rotation`` default must not silently reinterpret stored corpora.
+    """
+    from remax.core import SignBitQuantizer
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c, vectors, _ = _make_corpus(tmpdir)
+        before = c.search(vectors[3], k=5)
+        (Path(tmpdir) / "rotation.json").unlink()  # manufacture a legacy index
+
+        kw = SignBitQuantizer.__init__.__kwdefaults__
+        previous = kw["rotation"]
+        kw["rotation"] = "rht"
+        try:
+            reopened = Corpus(tmpdir)
+            assert reopened.rotation == "haar"
+            after = reopened.search(vectors[3], k=5)
+        finally:
+            kw["rotation"] = previous
+
+        assert [r.record_id for r in before] == [r.record_id for r in after]
+        assert [r.distance for r in before] == [r.distance for r in after]
+
+
+def test_rotation_property_is_read_only():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c, _, _ = _make_corpus(tmpdir)
+        with pytest.raises(AttributeError):
+            c.rotation = "rht"
+
+
+def test_rht_corpus_search_self_retrieval():
+    """An rht-built corpus round-trips: reopen and each vector finds itself."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rng = np.random.default_rng(3)
+        vectors = rng.standard_normal((40, 64))
+        ids = [f"doc-{i}" for i in range(40)]
+        Corpus.build(tmpdir, vectors, ids, seed=5, rotation="rht")
+        c = Corpus(tmpdir)
+        for i in (0, 17, 39):
+            assert c.search(vectors[i], k=1)[0].record_id == ids[i]
+
+
+def test_haar_and_rht_codes_differ():
+    """Guard the premise: the two constructions are not interchangeable."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rng = np.random.default_rng(11)
+        vectors = rng.standard_normal((30, 64))
+        ids = [f"doc-{i}" for i in range(30)]
+        a = Corpus.build(Path(tmpdir) / "a", vectors, ids, seed=2)
+        b = Corpus.build(Path(tmpdir) / "b", vectors, ids, seed=2, rotation="rht")
+        assert not np.array_equal(a.codes, b.codes)
+
+
+def test_build_unknown_rotation_raises():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rng = np.random.default_rng(0)
+        vectors = rng.standard_normal((10, 64))
+        with pytest.raises(ValueError, match="unknown rotation"):
+            Corpus.build(tmpdir, vectors, [f"d{i}" for i in range(10)],
+                         rotation="hadamard")
+
+
+def test_sidecar_unknown_rotation_raises():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_corpus(tmpdir)
+        (Path(tmpdir) / "rotation.json").write_text('{"rotation": "bogus"}')
+        with pytest.raises(ValueError, match="unknown rotation"):
+            Corpus(tmpdir)
+
+
+def test_sidecar_malformed_json_raises():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_corpus(tmpdir)
+        (Path(tmpdir) / "rotation.json").write_text("{not json")
+        with pytest.raises(ValueError, match="corrupt rotation.json"):
+            Corpus(tmpdir)
+
+
+def test_sidecar_wrong_shape_raises():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_corpus(tmpdir)
+        (Path(tmpdir) / "rotation.json").write_text('["haar"]')
+        with pytest.raises(ValueError, match="corrupt rotation.json"):
+            Corpus(tmpdir)
+
+
+def test_sidecar_non_string_rotation_raises():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_corpus(tmpdir)
+        (Path(tmpdir) / "rotation.json").write_text('{"rotation": 1}')
+        with pytest.raises(ValueError, match="must be a string"):
+            Corpus(tmpdir)
+
+
+def test_sidecar_file_mode_is_0600():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_corpus(tmpdir)
+        mode = (Path(tmpdir) / "rotation.json").stat().st_mode & 0o777
+        assert mode == 0o600
+
+
+def test_repr_mentions_non_default_rotation():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rng = np.random.default_rng(0)
+        vectors = rng.standard_normal((10, 64))
+        ids = [f"d{i}" for i in range(10)]
+        c = Corpus.build(tmpdir, vectors, ids, seed=0, rotation="rht")
+        assert "rotation='rht'" in repr(c)
+        # haar is the historical reading; keep the repr quiet for it
+        d = Corpus.build(Path(tmpdir) / "h", vectors, ids, seed=0)
+        assert "rotation=" not in repr(d)

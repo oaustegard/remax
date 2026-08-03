@@ -40,6 +40,15 @@ the same `(d, k, seed)`, and the on-disk index header has no field recording
 which was used, so flipping the default would silently invalidate every stored
 corpus. See "Not done here" below.
 
+> **Update.** `Corpus` now records the rotation in a `rotation.json` sidecar —
+> the binary header is untouched and `_VERSION` does not move. An *absent*
+> sidecar resolves to `"haar"` unconditionally rather than to the library
+> default, so a pre-sidecar index keeps decoding as it was written whatever the
+> default becomes. `bench/gates/rotation_identity_gate.py` asserts that
+> byte-identity across a default flip, and is shown red against the old reader.
+> This closes the `k=1` half of the objection only; the stacked ladder's `k`
+> and its per-stack rotations are still persisted by nothing.
+
 ---
 
 ## Step 1 — collision rate vs the published curve
@@ -194,14 +203,22 @@ concurrent factorizations just oversubscribe them.
 
 ## Not done here
 
-**`Corpus` cannot select a rotation.** Its on-disk header (`_MAGIC`, v1, 32
-bytes) records `(n, d, seed)` and nothing else, and `Corpus.load` reconstructs
-the quantizer from those three. Passing `rotation="rht"` through `build`
-would write an index that `load` silently reopens under Haar — codes that
-still decode, just from the wrong rotation, detectable only as degraded
-recall. Header bytes 6–7 are reserved and could carry a rotation tag, but
-spending them is a format-version decision, so it is left to a deliberate
-change rather than smuggled in here.
+**~~`Corpus` cannot select a rotation.~~** *Done — as a sidecar, not a header
+change.* The original objection stood: the header (`_MAGIC`, v1, 32 bytes)
+records `(n, d, seed)` and nothing else, so an rht-built index reopened under
+Haar decoded from the wrong rotation, detectable only as degraded recall.
+Header bytes 6–7 are reserved and could carry a rotation tag, but spending
+them is a format-version decision. `rotation.json` avoids that decision
+entirely — same idiom as `mean.npy`, a two-way door an older reader ignores —
+and `Corpus.build(..., rotation=...)` now round-trips. The load-bearing rule
+is that a *missing* sidecar means Haar by definition, never the current
+default.
+
+**`k` and the stacked ladder are still unpersisted.** Deliberately out of
+scope above: `Corpus` stores a single `SignBitQuantizer`, and
+`StackedSignBitQuantizer`'s `k` and per-stack rotations are recorded nowhere,
+so a stacked index carries exactly the hazard `rotation.json` just closed for
+`k=1`.
 
 **The remex-vs-remax scorer bias** raised in the back half of #59 is
 untouched. Nothing in this repo references `score_fidelity.py` or the
