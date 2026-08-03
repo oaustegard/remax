@@ -20,9 +20,9 @@ from typing import Sequence
 
 import numpy as np
 
-__all__ = ["characterize", "CharacterizeReport"]
+from .packing import encode_signs, hamming_distances
 
-_POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint16)
+__all__ = ["characterize", "CharacterizeReport"]
 
 DEFAULT_STRATEGIES: list[str] = ["sign-raw", "sign-centered", "pca", "haar-trunc"]
 DEFAULT_K_VALUES: list[int] = [64, 128, 256, 384, 512, 768]
@@ -44,39 +44,100 @@ _TRUTH_K = 10  # ground-truth cutoff when computed internally
 
 
 # ── Low-level search primitives ───────────────────────────────────────────────
+#
+# These are thin adapters over ``remax.packing``. They used to be a private
+# re-implementation — this module carried its own ``_POPCOUNT_LUT``, its own
+# sign-packer and its own XOR/popcount loop, and imported nothing from
+# ``packing`` — which meant ``characterize()`` ran the NumPy LUT fallback on
+# the largest grids in the codebase (strategies x k x 100-neighbour search over
+# the whole corpus, per cell) while the native POPCNT kernel sat unused a
+# module away. The duplication was also a correctness hazard in the ordinary
+# way: two popcount paths, one set of tests.
+#
+# What survives here is only what ``packing`` deliberately does not do: pad a
+# non-multiple-of-8 dimension. ``encode_signs`` rejects that input on purpose,
+# because a remax *index* with a ragged trailing byte is a bug. A
+# characterization sweep is the other case — it walks arbitrary k values
+# (a PCA rank, a sketch width) that have no reason to be divisible by 8, and
+# zero-padding is the right answer there since a zero pads to sign bit 0 in
+# both the corpus and the query and so contributes a constant to every
+# distance. Keeping the pad local documents that it is a sweep concession, not
+# an index format.
 
 
 def _sign_pack(X: np.ndarray) -> np.ndarray:
-    """sign(X) → packed uint8, padding trailing dim to a multiple of 8."""
+    """sign(X) → packed uint8, padding trailing dim to a multiple of 8.
+
+    Zero-padding is the only difference from :func:`remax.packing.encode_signs`,
+    which this delegates to; see the note above for why the pad lives here.
+    """
     if X.ndim == 1:
         X = X[None, :]
     pad = (8 - X.shape[1] % 8) % 8
     if pad:
         X = np.pad(X, ((0, 0), (0, pad)))
-    return np.packbits(X > 0, axis=1)
+    return encode_signs(X)
 
 
 def _hamming_topN(q_codes: np.ndarray, c_codes: np.ndarray, N: int) -> np.ndarray:
-    """Top-N by Hamming distance, returns (nq, min(N, n)) index array."""
-    N = min(N, c_codes.shape[0])
+    """Top-N by Hamming distance, returns (nq, min(N, n)) index array.
+
+    Distances come from :func:`remax.packing.hamming_distances`, so this picks
+    up the native POPCNT kernel when it is available.
+
+    The *selection* is deliberately still ``argpartition`` + ``argsort`` rather
+    than :func:`remax.packing.stable_top_k`. Hamming distances are small
+    integers over a large corpus, so ties are the norm rather than the
+    exception, and the two selectors break ties differently — swapping it in
+    would silently move members in and out of the top-N and shift every recall
+    number in every published characterization table. That is a behaviour
+    change wearing a refactor's clothes. It may be worth making on purpose
+    later; it is not part of routing this through the shared kernel.
+    """
+    n = c_codes.shape[0]
+    N = min(N, n)
     nq = q_codes.shape[0]
     out = np.empty((nq, N), dtype=np.intp)
     for i in range(nq):
-        d = _POPCOUNT_LUT[np.bitwise_xor(c_codes, q_codes[i])].sum(1)
-        part = np.argpartition(d, N)[:N]
-        out[i] = part[np.argsort(d[part])]
+        d = hamming_distances(c_codes, q_codes[i])
+        out[i] = _select_smallest(d, N, n)
     return out
+
+
+def _select_smallest(scores: np.ndarray, N: int, n: int) -> np.ndarray:
+    """Indices of the ``N`` smallest of ``scores``, ascending.
+
+    Split out because ``np.argpartition(scores, N)`` raises when ``N == n``
+    (``kth`` must be < ``len``), which made both top-N helpers — and therefore
+    ``characterize()`` itself — crash outright on any corpus of fewer than 100
+    vectors with ``ValueError: kth(=n) out of bounds (n)``. Pre-existing, and
+    invisible because every test used a corpus larger than the 100-neighbour
+    request.
+
+    The ``N < n`` branch keeps ``kth=N`` exactly as before rather than the
+    ``kth=N-1`` that would also be correct: at integer Hamming distances ties
+    are the norm, and the two choices can select *different* tied indices at
+    the boundary, which would quietly move every recall number in every
+    published characterization table. When ``N == n`` every row is selected,
+    so only the within-selection order can differ, and the caller
+    (:func:`_recall_set`) compares sets.
+    """
+    if N >= n:
+        return np.argsort(scores, kind="stable")
+    part = np.argpartition(scores, N)[:N]
+    return part[np.argsort(scores[part])]
 
 
 def _float32_topN(queries: np.ndarray, corpus: np.ndarray, N: int) -> np.ndarray:
     """Top-N by float32 IP, returns (nq, min(N, n)) index array."""
-    N = min(N, corpus.shape[0])
+    n = corpus.shape[0]
+    N = min(N, n)
     sims = queries @ corpus.T
     nq = queries.shape[0]
     out = np.empty((nq, N), dtype=np.intp)
     for i in range(nq):
-        part = np.argpartition(-sims[i], N)[:N]
-        out[i] = part[np.argsort(-sims[i, part])]
+        # Negated: _select_smallest is ascending, higher IP is better.
+        out[i] = _select_smallest(-sims[i], N, n)
     return out
 
 
