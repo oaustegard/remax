@@ -38,13 +38,14 @@ from .packing import (
     hamming_search,
     stable_top_k,
 )
-from .rotation import haar_rotation
+from .rotation import ROTATIONS, build_rotation, haar_rotation, rht_rotation
 
 __all__ = [
     "SignBitQuantizer",
     "asymmetric_scores",
     "asymmetric_search",
     "haar_rotation",
+    "rht_rotation",
     "encode_signs",
     "hamming_distances",
     "hamming_search",
@@ -69,6 +70,12 @@ class SignBitQuantizer:
         silicon enables Accelerate's f32 path. Pass ``np.float64`` for
         bit-exact compatibility with corpora encoded before this default
         changed; recall is statistically identical either way.
+    rotation : {"haar", "rht"}, default="haar"
+        Rotation construction. ``"haar"`` is the Haar-distributed QR path.
+        ``"rht"`` is a randomized Hadamard transform — cheaper to build
+        (``O(d² log d)`` vs ``O(d³)``) and measured equivalent for retrieval
+        (remax#59 — see :mod:`remax.rotation`). Codes are **not**
+        interchangeable between the two.
 
     Attributes
     ----------
@@ -78,6 +85,8 @@ class SignBitQuantizer:
         RNG seed used for the rotation.
     dtype : numpy dtype
         Working precision (matches ``rotation_.dtype``).
+    rotation : str
+        The rotation construction in use.
     rotation_ : np.ndarray, shape (d, d)
         Orthogonal rotation matrix. Established at construction time;
         ``fit`` is a no-op kept for sklearn-style ergonomics.
@@ -103,6 +112,7 @@ class SignBitQuantizer:
         seed: int | None = None,
         *,
         dtype: np.dtype | type = np.float32,
+        rotation: str = "haar",
     ):
         if not isinstance(d, (int, np.integer)) or d <= 0:
             raise ValueError(f"d must be a positive integer, got {d!r}")
@@ -111,11 +121,17 @@ class SignBitQuantizer:
                 f"d must be divisible by 8 (got d={d}); remax codes are "
                 "bit-packed into uint8 bytes."
             )
+        if rotation not in ROTATIONS:
+            raise ValueError(
+                f"unknown rotation {rotation!r}; expected one of "
+                f"{sorted(ROTATIONS)}."
+            )
         self.d: int = int(d)
         self.seed: int | None = seed
         self.dtype: np.dtype = np.dtype(dtype)
-        self.rotation_: np.ndarray = haar_rotation(
-            self.d, seed=seed, dtype=self.dtype
+        self.rotation: str = rotation
+        self.rotation_: np.ndarray = build_rotation(
+            rotation, self.d, seed=seed, dtype=self.dtype
         )
         self.n_bits: int = self.d
 

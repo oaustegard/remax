@@ -27,12 +27,14 @@ Future work is tracked in [issues](https://github.com/oaustegard/remax/issues). 
 - `StackedSignBitQuantizer` — k-stack precision ladder (k=2,4,8 tested). Every step shrinks variance by 1/k while remaining rank-correct. No broken middle.
 - `Corpus` — packed binary codes + SQLite metadata sidecar. Maps array indices to record IDs with JSON metadata per record. [Postgres recipe](docs/postgres-recipe.md) included.
 - `characterize()` — sweep a strategy × k grid on your encoder and get a recommended operating point.
+- Rotation choice — `rotation="haar"` (default, Haar-distributed QR) or `rotation="rht"` (randomized Hadamard, 1.5–1.8× faster to build). Measured equivalent for retrieval; see [`ROTATION_LSH.md`](bench/results/ROTATION_LSH.md) for why a structured rotation needed re-measuring here rather than inheriting remex's result, and for the single-round construction it rules out.
 - Native Hamming scan — C extension compiled at first import with hardware POPCNT. 23× over NumPy (9.7 GB/s effective throughput, within 1.3× of memcpy ceiling).
 
 **Benchmark suite** (`bench/`):
 - [`BASELINE.md`](bench/results/BASELINE.md) — R@10 vs float32 ground truth across the stacked precision ladder. 1-bit: 0.635, k=2: 0.676, k=4: 0.706, k=8: 0.718.
 - [`CROSSOVER.md`](bench/results/CROSSOVER.md) — side-by-side R@10 of remax stacked SimHash vs remex Lloyd-Max at matched bits-per-dim.
 - [`RERANK.md`](bench/results/RERANK.md) — two-stage pipeline: sign-bit stage 1 → float32-IP rerank recovers to R@10 = 0.983 at 0.1 ms/query. Cross-encoder rerank (ms-marco-MiniLM-L-6-v2, ONNX Runtime) tested and characterized.
+- [`ROTATION_LSH.md`](bench/results/ROTATION_LSH.md) — does the Charikar collision guarantee survive a structured rotation? Collision rate vs `θ/π`, estimator spread, cross-stack independence, then end-to-end recall. Also documents two optimizations measured and rejected.
 - [`SKETCH_MATRYOSHKA.md`](bench/results/SKETCH_MATRYOSHKA.md) / [`SKETCH_MATRYOSHKA_GEMINI.md`](bench/results/SKETCH_MATRYOSHKA_GEMINI.md) — post-hoc Matryoshka via random-dimension sketching on SPECTER2 and Gemini embeddings.
 
 **Test suite**: full coverage across core, stacked, corpus, native, characterize, and all benchmark modules. Security hardening pass completed.
