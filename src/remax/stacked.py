@@ -207,6 +207,27 @@ class StackedSignBitQuantizer:
             self.d, self.k, self.d
         ).transpose(1, 0, 2)
 
+    @rotations_.setter
+    def rotations_(self, value: np.ndarray) -> None:
+        """Replace all ``k`` rotations, writing through into the buffer.
+
+        Takes the same ``(k, d, d)`` shape the getter returns. Downstream
+        callers substitute their own projection here — remax_kb swaps in an
+        SRHT or Rademacher stack, or the int8-dequantized rotations, so that
+        corpus codes and shipped rotations agree. Writing through keeps the
+        single-buffer invariant the getter documents: there is still only one
+        representation.
+        """
+        arr = np.asarray(value, dtype=self.dtype)
+        expected = (self.k, self.d, self.d)
+        if arr.shape != expected:
+            raise ValueError(
+                f"rotations_ must have shape {expected}, got {arr.shape}"
+            )
+        self._rotation_matrix[:] = arr.transpose(1, 0, 2).reshape(
+            self.d, self.k * self.d
+        )
+
     # ------------------------------------------------------------------ #
     # sklearn-style API
     # ------------------------------------------------------------------ #

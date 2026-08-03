@@ -307,3 +307,36 @@ def test_stacking_shrinks_estimator_spread(kind):
     # the point is monotone shrinkage at about the right rate.
     assert sds[1] < sds[0] * 0.75, f"{kind}: k=4 spread {sds} did not shrink"
     assert sds[2] < sds[1] * 0.75, f"{kind}: k=16 spread {sds} did not shrink"
+
+
+# 1d. rotations_ is assignable, and assignment writes through the buffer
+# ---------------------------------------------------------------------
+def test_rotations_setter_writes_through():
+    """Downstream callers (remax_kb) substitute their own projection stack.
+
+    Making ``rotations_`` a property in #59 dropped the setter, which broke
+    every consumer that assigned to it. Assignment must land in
+    ``_rotation_matrix`` so encode() sees the substituted stack.
+    """
+    q = StackedSignBitQuantizer(d=32, k=3, seed=7)
+    rng = np.random.default_rng(0)
+    new = rng.normal(size=(3, 32, 32)).astype(q.dtype)
+
+    q.rotations_ = new
+
+    assert np.array_equal(q.rotations_, new)
+    for j in range(3):
+        assert np.array_equal(
+            q._rotation_matrix[:, j * 32 : (j + 1) * 32], new[j]
+        )
+    assert not q.rotations_.flags.owndata
+
+    X = rng.normal(size=(4, 32)).astype(np.float32)
+    expected = np.packbits((X @ new.transpose(1, 0, 2).reshape(32, 96)) > 0, axis=1)
+    assert np.array_equal(q.encode(X), expected)
+
+
+def test_rotations_setter_rejects_wrong_shape():
+    q = StackedSignBitQuantizer(d=32, k=3, seed=7)
+    with pytest.raises(ValueError, match=r"shape"):
+        q.rotations_ = np.zeros((2, 32, 32), dtype=q.dtype)
