@@ -70,3 +70,5 @@ bench/results/*
 !bench/results/lfm25_finetune_feasibility.json
 !bench/results/lfm25_finetune_retrieval.json
 !bench/results/lfm25_finetune_retrieval_1epoch.json
+!bench/results/LFM25_LEARNED_ROTATION.md
+!bench/results/LFM25_FINETUNE.md
