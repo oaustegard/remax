@@ -41,7 +41,7 @@ import numpy as np
 
 from .packing import (POPCOUNT_LUT, asymmetric_scores, hamming_distances,
                       stable_top_k)
-from .rotation import haar_rotation
+from .rotation import ROTATIONS, build_rotation
 
 __all__ = ["StackedSignBitQuantizer"]
 
@@ -49,7 +49,7 @@ __all__ = ["StackedSignBitQuantizer"]
 class StackedSignBitQuantizer:
     """k-stack cosine LSH quantizer (stacked SimHash).
 
-    Holds ``k`` independent Haar rotations. Encoding each input row produces
+    Holds ``k`` independent rotations. Encoding each input row produces
     ``k`` packed sign-bit signatures concatenated into a single
     ``(k * d // 8)``-byte code. Hamming distance over these codes is — in
     expectation — a monotone function of the angle between the original
@@ -77,6 +77,16 @@ class StackedSignBitQuantizer:
         large ``k``, so the f32 default also halves stacked-encode peak
         RSS. Pass ``np.float64`` for bit-exact compatibility with corpora
         encoded before this default changed.
+    rotation : {"haar", "rht"}, default="haar"
+        Rotation construction. ``"haar"`` is the Haar-distributed QR path.
+        ``"rht"`` is a randomized Hadamard transform: 1.5–1.8× faster to
+        build over ``d ∈ {768…3072}``, with recall measured
+        statistically indistinguishable from Haar on three real corpora
+        (remax#59 — see :mod:`remax.rotation`). Prefer it when construction
+        time is the bottleneck, which at large ``d`` and large ``k`` it
+        usually is. Codes are **not** interchangeable between the two: a
+        corpus encoded under one cannot be searched under the other, and
+        nothing detects the mismatch beyond degraded recall.
 
     Attributes
     ----------
@@ -88,10 +98,16 @@ class StackedSignBitQuantizer:
         Master seed.
     dtype : numpy dtype
         Working precision (matches ``rotations_.dtype``).
+    rotation : str
+        The rotation construction in use.
     n_bits : int
         Total bits per code, ``k * d``.
     rotations_ : np.ndarray, shape (k, d, d)
-        Stack of ``k`` independent Haar rotation matrices.
+        Stack of ``k`` independent rotation matrices. A zero-copy **view**
+        onto the flattened projection matrix the encode matmul consumes, so
+        the two cannot desync and the stack is stored once rather than
+        twice (at ``d=3072, k=8`` that is 302 MB resident instead of 604 MB).
+        Writes through this view reach the projection matrix, as intended.
 
     Examples
     --------
@@ -121,6 +137,7 @@ class StackedSignBitQuantizer:
         seed: int | None = None,
         *,
         dtype: np.dtype | type = np.float32,
+        rotation: str = "haar",
     ):
         if not isinstance(d, (int, np.integer)) or d <= 0:
             raise ValueError(f"d must be a positive integer, got {d!r}")
@@ -131,10 +148,16 @@ class StackedSignBitQuantizer:
             )
         if not isinstance(k, (int, np.integer)) or k <= 0:
             raise ValueError(f"k must be a positive integer, got {k!r}")
+        if rotation not in ROTATIONS:
+            raise ValueError(
+                f"unknown rotation {rotation!r}; expected one of "
+                f"{sorted(ROTATIONS)}."
+            )
         self.d: int = int(d)
         self.k: int = int(k)
         self.seed: int | None = seed
         self.dtype: np.dtype = np.dtype(dtype)
+        self.rotation: str = rotation
         self.n_bits: int = self.k * self.d
 
         # Spawn k independent uint32 seeds from the master via SeedSequence.
@@ -144,14 +167,7 @@ class StackedSignBitQuantizer:
         ss = np.random.SeedSequence(seed)
         child_states = ss.generate_state(self.k, dtype=np.uint32)
 
-        rotations = np.empty((self.k, self.d, self.d), dtype=self.dtype)
-        for j in range(self.k):
-            rotations[j] = haar_rotation(
-                self.d, seed=int(child_states[j]), dtype=self.dtype
-            )
-        self.rotations_: np.ndarray = rotations
-
-        # Pre-flatten the k rotations into a single (d, k * d) projection
+        # Build the k rotations straight into a single (d, k * d) projection
         # matrix so encode() can apply all stacks with one BLAS matmul
         # (X @ self._rotation_matrix) instead of an einsum followed by a
         # transpose-copy of a (k, n, d) intermediate. Stacking the rotations
@@ -159,9 +175,37 @@ class StackedSignBitQuantizer:
         # packed bits already land in the row-contiguous (n, k * d // 8)
         # layout — no rearrange needed. Output is bit-identical to the einsum
         # path; see encode().
-        self._rotation_matrix: np.ndarray = np.ascontiguousarray(
-            rotations.transpose(1, 0, 2).reshape(self.d, self.k * self.d)
+        #
+        # Writing each rotation directly into its column block, rather than
+        # filling a (k, d, d) array and then flattening it, means the stack
+        # exists in memory once instead of twice — ``rotations_`` below is a
+        # view back onto this buffer, not a second copy.
+        self._rotation_matrix: np.ndarray = np.empty(
+            (self.d, self.k * self.d), dtype=self.dtype
         )
+        for j in range(self.k):
+            self._rotation_matrix[:, j * self.d : (j + 1) * self.d] = (
+                build_rotation(
+                    rotation,
+                    self.d,
+                    seed=int(child_states[j]),
+                    dtype=self.dtype,
+                )
+            )
+
+    @property
+    def rotations_(self) -> np.ndarray:
+        """The ``k`` per-stack rotations as a ``(k, d, d)`` zero-copy view.
+
+        ``_rotation_matrix`` holds the stack side by side as ``(d, k * d)``;
+        reshaping to ``(d, k, d)`` and swapping the first two axes recovers
+        the per-stack view without touching memory. Keeping this a view
+        rather than a stored second copy halves resident rotation memory and
+        removes any way for the two representations to disagree.
+        """
+        return self._rotation_matrix.reshape(
+            self.d, self.k, self.d
+        ).transpose(1, 0, 2)
 
     # ------------------------------------------------------------------ #
     # sklearn-style API
