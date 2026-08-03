@@ -1,7 +1,8 @@
 """remax.corpus — Corpus: paired bit-vector index + SQLite metadata store.
 
-Bridges the gap between raw array indices returned by ``hamming_search``
-and the actual documents/records those positions represent.
+Bridges the gap between raw array indices returned by
+``SignBitQuantizer.search`` and the actual documents/records those
+positions represent.
 
 Schema
 ------

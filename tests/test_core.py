@@ -1,6 +1,6 @@
 """Tests for ``remax.core`` — the 1-bit ``SignBitQuantizer`` and the
 functional primitives it composes (``haar_rotation``, ``encode_signs``,
-``hamming_distances``, ``hamming_search``).
+``hamming_distances``).
 
 Required by issue #2:
 
@@ -23,7 +23,6 @@ from remax import (
     encode_signs,
     haar_rotation,
     hamming_distances,
-    hamming_search,
 )
 
 
@@ -236,24 +235,6 @@ def test_encode_accepts_single_vector():
     code = q.encode(x)
     assert code.shape == (d // 8,)
     assert code.dtype == np.uint8
-
-
-def test_hamming_search_functional_api():
-    """The standalone functional ``hamming_search`` matches the class API."""
-    rng = np.random.default_rng(9)
-    n, d = 80, 128
-    X = rng.standard_normal((n, d))
-    R = haar_rotation(d, seed=9)
-    codes = encode_signs(X @ R)
-
-    qvec = X[7]
-    idx_func = hamming_search(qvec @ R, codes, k=5)
-
-    q = SignBitQuantizer(d=d, seed=9)
-    np.testing.assert_array_equal(q.rotation_, R)  # same seed
-    idx_class = q.search(qvec, q.encode(X), k=5)
-
-    np.testing.assert_array_equal(idx_func, idx_class)
 
 
 def test_hamming_distances_symmetry():

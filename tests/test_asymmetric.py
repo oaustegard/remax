@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from remax import SignBitQuantizer, StackedSignBitQuantizer, asymmetric_scores
-from remax.packing import asymmetric_search, encode_signs
+from remax.packing import encode_signs
 
 
 def _dense_reference(q_rot, X_rot):
@@ -93,16 +93,6 @@ class TestAsymmetricSearch:
         codes = q.encode(X)
         assert q.search(X[3], codes, k=5)[0] == 3
         assert q.search_asymmetric(X[3], codes, k=5)[0] == 3
-
-    def test_functional_api_agrees_with_method(self):
-        rng = np.random.default_rng(7)
-        X = rng.standard_normal((150, 64)).astype(np.float32)
-        q = SignBitQuantizer(d=64, seed=42)
-        codes = q.encode(X)
-        np.testing.assert_array_equal(
-            q.search_asymmetric(X[0], codes, k=5),
-            asymmetric_search(X[0] @ q.rotation_, codes, k=5),
-        )
 
     def test_k_larger_than_corpus_is_clamped(self):
         rng = np.random.default_rng(8)

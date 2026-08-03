@@ -69,7 +69,7 @@ con.close()
 
 ---
 
-## Querying after `hamming_search`
+## Querying after `SignBitQuantizer.search`
 
 `Corpus.search()` already handles metadata retrieval for the SQLite case.
 For Postgres, retrieve raw indices from `SignBitQuantizer.search()` and

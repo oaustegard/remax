@@ -33,10 +33,8 @@ import numpy as np
 from .packing import (
     as_codes,
     asymmetric_scores,
-    asymmetric_search,
     encode_signs,
     hamming_distances,
-    hamming_search,
     stable_top_k,
 )
 from .rotation import ROTATIONS, build_rotation, haar_rotation, rht_rotation
@@ -44,12 +42,10 @@ from .rotation import ROTATIONS, build_rotation, haar_rotation, rht_rotation
 __all__ = [
     "SignBitQuantizer",
     "asymmetric_scores",
-    "asymmetric_search",
     "haar_rotation",
     "rht_rotation",
     "encode_signs",
     "hamming_distances",
-    "hamming_search",
 ]
 
 
