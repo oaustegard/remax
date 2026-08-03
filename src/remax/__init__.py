@@ -28,7 +28,12 @@ from .corpus import Corpus, Result
 from .stacked import StackedSignBitQuantizer
 from ._native import AVAILABLE as NATIVE_AVAILABLE
 
-__version__ = "0.0.0"
+try:  # pragma: no cover - trivial dispatch
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("remax")
+except PackageNotFoundError:  # bare source checkout, not installed
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "SignBitQuantizer",
