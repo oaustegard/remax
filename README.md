@@ -45,28 +45,45 @@ Future work is tracked in [issues](https://github.com/oaustegard/remax/issues). 
 pip install -e .
 ```
 
+Every `python` block in this file is executed verbatim by
+`tests/test_readme.py`, so what follows runs as written — swap in your own
+embeddings for the synthetic ones.
+
 ```python
 import numpy as np
 import remax
 
-# Encode
+rng = np.random.default_rng(0)
+embeddings = rng.standard_normal((1000, 768), dtype=np.float32)
+query = rng.standard_normal(768, dtype=np.float32)
+paper_ids = [f"paper-{i}" for i in range(len(embeddings))]
+
+# Encode: 768 float32 dims (3 KB/vector) → 96 packed bytes
 q = remax.SignBitQuantizer(d=768, seed=42)
-codes = q.encode(embeddings)          # (n, 96) uint8
+codes = q.encode(embeddings)                     # (1000, 96) uint8
 
-# Search
-dists = remax.hamming_distances(q.encode(query), codes)
-top_k = np.argsort(dists[0])[:10]
+# Search: top-k by Hamming distance
+top_k, dists = q.search(query, codes, k=10, return_distances=True)
 
-# Stacked precision ladder
+# The functional API underneath, when you want the whole distance vector.
+# Corpus first, query second — and the result is 1-D over the corpus.
+all_dists = remax.hamming_distances(codes, q.encode(query))   # (1000,) int32
+
+# Stacked precision ladder: k independent rotations, k bits per dimension
 sq = remax.StackedSignBitQuantizer(d=768, k=4, seed=42)
-codes = sq.encode(embeddings)         # (n, 384) uint8 — 4× wider, rank-correct
-dists = sq.hamming_distances(sq.encode(query), codes)
+stacked_codes = sq.encode(embeddings)            # (1000, 384) uint8 — 4× wider
+stacked_top_k = sq.search(query, stacked_codes, k=10)
 
-# Corpus with metadata
-corpus = remax.Corpus.create("papers.bin", embeddings, sq,
-                              record_ids=paper_ids,
-                              metadata=[{"title": t} for t in titles])
-results = corpus.search(query_embedding, k=10)  # List[Result]
+# Corpus with metadata. build() takes a *directory*, not a file, and
+# quantizes internally — it does not accept a quantizer.
+corpus = remax.Corpus.build(
+    "papers/", embeddings, paper_ids,
+    seed=42,
+    meta=[{"title": f"Paper {i}"} for i in range(len(embeddings))],
+    center=True,          # stores the corpus mean; search() re-applies it
+)
+results = corpus.search(query, k=10)             # list[Result]
+print(results[0].rank, results[0].record_id, results[0].distance, results[0].meta)
 ```
 
 Native POPCNT acceleration is automatic when available (check `remax.NATIVE_AVAILABLE`).
