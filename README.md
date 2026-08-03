@@ -88,6 +88,51 @@ print(results[0].rank, results[0].record_id, results[0].distance, results[0].met
 
 Native POPCNT acceleration is automatic when available (check `remax.NATIVE_AVAILABLE`).
 
+### Scaling the query path
+
+The scan is exhaustive and stays exhaustive — remax has no cells, no probes and
+no candidate pruning, so recall is a property of the code rather than of a
+parameter you can get wrong. What *is* tunable is how fast the same answers
+arrive. Every option below is **bit-identical** to its default; none of them
+can change a neighbour.
+
+```python
+# The C kernel is reached through ctypes, which releases the GIL, so the scan
+# threads with no change to the C. Off by default — a library that spawns
+# threads inside your worker pool is a bad neighbour. Row blocks partition the
+# corpus, so every thread count gives the identical answer.
+top_k_threaded = q.search(query, codes, k=10, threads="auto")
+
+# Process-wide, if you would rather not pass it at every call site:
+remax.packing.set_default_threads(1)   # "auto" for all cores; REMAX_THREADS too
+
+# Threading a small corpus measures SLOWER than not threading it, so remax
+# bypasses the pool below a measured size rather than trusting the argument.
+
+# A batch reads the corpus once per cache-sized block for all m queries
+# instead of once per query. Automatic for m >= 2.
+batch_top_k = q.search(embeddings[:8], codes, k=10)
+
+# mmap an index instead of reading it into private heap: O(1) open, pages
+# faulted in on touch, shared between processes, evictable under memory
+# pressure. The default is still "load" — the historical behaviour.
+with remax.Corpus("papers/", residency="mmap") as mapped:
+    mapped_results = mapped.search(query, k=10)
+
+# Asymmetric scoring: keep the query in float against the stored sign bits.
+# Same index, same bytes on disk; a query occupies no index storage, so
+# binarizing it buys nothing. Worth +0.019 nDCG@10 at 128 B/vector on
+# LFM2.5/SciFact, +0.084 at 16 B. Substantially slower — it cannot use the
+# popcount kernel — so it is opt-in rather than the default.
+better = corpus.search(query, k=10, asymmetric=True)
+```
+
+Measurements, with the box and the scope limits stated, are in
+[`bench/results/QUERY_PATH_SPEED.md`](bench/results/QUERY_PATH_SPEED.md). That
+the answers do not change is not measured but *gated*:
+`bench/gates/query_path_gate.py`, which proves itself by going red under 14
+simulated defects.
+
 ## Relationship to remex
 
 [remex](https://github.com/oaustegard/remex) is the multi-precision Lloyd-Max + Matryoshka library it shares lineage with. remex is a Swiss Army knife optimized for storage MSE, with rank-correct 1-bit *as a free MSB extraction*. remax is a chisel optimized for rank, exclusively.

@@ -67,14 +67,36 @@ __all__ = [
 # gets the same single-threaded call sequence, the same peak memory, and the
 # same lack of a background pool as before this existed.
 
-_MIN_ROWS_PER_THREAD = 1 << 14
-"""Below this many rows per thread, run serially instead.
+_MIN_BYTES_PER_THREAD = 2 << 20
+"""Below this many *bytes* of code per thread, run serially instead.
 
-Pool dispatch costs ~20-40 us per call on the measurement box. A block that
-takes less than that to scan is pure loss, and a tiny corpus scanned in a tight
-loop would pay it on every query. Derived from measurement, not taste:
-16384 rows x 32 B is 512 KB, ~50 us of scan at the ~10 GB/s single-core rate.
+Bytes, not rows. The scan is bandwidth-bound, so what a thread has to do is
+set by how many bytes its block holds; a row count means different work at
+B=32 and B=96 and would put the cutoff in a different place for each.
+
+Derived from measurement on the box in ``bench/results/QUERY_PATH_SPEED.md``,
+where pool dispatch costs ~60 us for 2-4 tasks (~167 us at 8, oversubscribed)
+against a ~9.7 GB/s single-core scan:
+
+    bytes/thread   T=4 speedup
+    0.8 MB         0.76x   (net loss)
+    1.6 MB         1.48x
+    3.2 MB         2.08x
+    6.4 MB         3.27x
+
+Break-even is around 1 MB per thread; the floor sits at 2 MB so the threaded
+path is only taken where it was measured to win with margin.
+
+This started at 16384 *rows*, which at B=32 is 512 KB — comfortably inside the
+losing region. The benchmark caught it: threading at n=1e5 measured 0.5-0.8x,
+a slowdown that the correctness gate is structurally unable to see, because the
+answers were right the whole time.
 """
+
+
+def _max_workers_for(nbytes: int) -> int:
+    """How many threads this much code can keep usefully busy."""
+    return max(1, nbytes // _MIN_BYTES_PER_THREAD)
 
 _default_threads: int = 1
 _pool_lock = threading.Lock()
@@ -399,8 +421,9 @@ def hamming_distances(
         result is **bit-identical** to a serial scan for every thread count —
         this is a property of the decomposition, not a tolerance.
 
-        Small corpora bypass the pool entirely (see ``_MIN_ROWS_PER_THREAD``):
-        dispatch overhead exceeds the work.
+        Small corpora bypass the pool entirely (see
+        ``_MIN_BYTES_PER_THREAD``): dispatch overhead exceeds the work, and
+        threading them measures *slower*.
 
     Returns
     -------
@@ -421,8 +444,8 @@ def hamming_distances(
     out = _as_out(out, n)
     workers = resolve_threads(threads)
     # Cap the worker count so no thread gets a block too small to pay for its
-    # own dispatch, and so a 100-row corpus never touches the pool at all.
-    workers = min(workers, max(1, n // _MIN_ROWS_PER_THREAD))
+    # own dispatch, and so a small corpus never touches the pool at all.
+    workers = min(workers, _max_workers_for(codes.nbytes))
     if workers <= 1:
         return _scan_serial(codes, q, out)
     return _scan_threaded(codes, q, out, workers)
@@ -455,12 +478,26 @@ def hamming_distances(
 # this whole path has to not commit. bench/gates/query_path_gate.py simulates
 # it (--simulate counting-select-tie-break) and it goes red.
 
-#: Below this many rows, argpartition wins — the histogram's two extra linear
-#: passes cost more than the permutation it avoids. Measured crossover on the
-#: box in bench/results/QUERY_PATH_SPEED.md is between 1e5 (0.8-1.0x) and 1e6
-#: (1.3-1.4x); the threshold sits at 2^20 so the counting path is only taken
-#: where it was measured to help.
-COUNTING_MIN_N = 1 << 20
+#: Below this many rows, argpartition wins on *time* — the histogram's extra
+#: linear passes cost more than the permutation they avoid. Measured on the box
+#: in bench/results/QUERY_PATH_SPEED.md (min of 11, k=10 and k=100):
+#:
+#:     n        counting vs argpartition
+#:     1e5      0.99-1.01x
+#:     3e5      0.88-0.89x
+#:     1e6      0.88-0.95x
+#:     3e6      1.13-1.25x
+#:     1e7      2.43-2.63x
+#:
+#: so the crossover is around 2e6 and the threshold sits at 2^21 = 2,097,152.
+#: An earlier 2^20 put it inside the losing region — measured, not reasoned.
+#:
+#: Note what the threshold is NOT chosen on: the counting path allocates ~2 KB
+#: against argpartition's 8n bytes at *every* size, and that advantage is
+#: largest in relative terms exactly where it loses on time. Time is the
+#: criterion here because remax has no evidence about the allocation mattering;
+#: a caller under memory pressure can call counting_top_k directly.
+COUNTING_MIN_N = 1 << 21
 
 #: Widest value alphabet the histogram is allowed. 65537 int64 counters is
 #: 512 KB — past that the histogram stops being the cheap side. B=8192 (a

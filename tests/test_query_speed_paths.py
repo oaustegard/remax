@@ -42,16 +42,17 @@ from remax.packing import (
 D = 128
 N = 5000
 
-#: Rows used by the threading tests. It has to exceed
-#: ``_MIN_ROWS_PER_THREAD * 2``, or ``hamming_distances`` bypasses the pool and
-#: the tests pass without ever running a thread — which is how the first draft
-#: of this file "passed" the threading section at N=5000 (workers collapsed to
-#: 1 every time). Codes are drawn directly rather than encoded, because these
-#: tests are about the scan decomposition, not about the encoder.
-N_THREADED = 4 * packing._MIN_ROWS_PER_THREAD + 137
+#: Rows used by the threading tests. The corpus has to carry enough BYTES to
+#: keep several workers past ``_MIN_BYTES_PER_THREAD``, or ``hamming_distances``
+#: bypasses the pool and the tests pass without ever running a thread — which is
+#: how the first draft of this file "passed" the threading section at N=5000
+#: (workers collapsed to 1 every time). Sized from the library's own rule so the
+#: two cannot drift apart. Codes are drawn directly rather than encoded, because
+#: these tests are about the scan decomposition, not about the encoder.
+N_THREADED = 4 * (packing._MIN_BYTES_PER_THREAD // (D // 8)) + 137
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def data():
     rng = np.random.default_rng(11)
     X = rng.standard_normal((N, D)).astype(np.float32)
@@ -59,7 +60,7 @@ def data():
     return X, q, q.encode(X)
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def big_codes():
     rng = np.random.default_rng(21)
     codes = rng.integers(0, 256, size=(N_THREADED, D // 8), dtype=np.uint8)
@@ -93,7 +94,7 @@ def test_the_threading_fixture_actually_threads(big_codes):
     """
     codes, query = big_codes
     n = codes.shape[0]
-    assert min(4, max(1, n // packing._MIN_ROWS_PER_THREAD)) > 1
+    assert min(4, packing._max_workers_for(codes.nbytes)) > 1
     packing._pools.clear()
     hamming_distances(codes, query, threads=4)
     assert packing._pools, "the pool was never used; the tests below are moot"

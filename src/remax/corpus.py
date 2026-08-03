@@ -379,6 +379,16 @@ class Corpus:
             Distances, neighbours and metadata are identical under both: the
             bytes are the same bytes.
 
+            One caveat on :meth:`close`. It closes the SQLite connections, as
+            it always has, but it does **not** unmap the index — dropping the
+            mapping out from under an array a caller may still hold a
+            reference to (``corpus.codes``) would turn a use-after-close into
+            a segfault rather than an exception, which is a much worse
+            failure than the one it would fix. The mapping is released when
+            the ``Corpus`` and any arrays derived from it are collected. On
+            Windows that means an open mapping can delay removing the corpus
+            directory; drop your references first if that matters.
+
         Notes
         -----
         The rotation construction is read from the ``rotation.json``

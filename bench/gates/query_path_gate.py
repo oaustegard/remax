@@ -49,8 +49,8 @@ changing what it returns", and all of them with the same shape of failure:
   queries. A merge that forgets earlier blocks returns the last block's
   neighbours: k results, right shape, right dtype, wrong documents.
 
-Speed is what motivated all eight and speed is NOT gated here. See the
-coverage notes and ``bench/results/QUERY_PATH_SPEED.md``.
+Speed is what motivated every one of these changes, and speed is NOT gated
+here. See the coverage notes and ``bench/results/QUERY_PATH_SPEED.md``.
 
 Anchors
 -------
@@ -95,7 +95,11 @@ fails unless every one drives the gate to exit 1. That is the check on the
 gate, as distinct from the check on the code.
 
 Deliberately NOT gated: speed. There is no anchor for how fast this should
-run — see ``bench/native_speedup.py``, which is a benchmark and says so.
+run — see ``bench/query_path_speed.py`` and ``bench/native_speedup.py``, which
+are benchmarks and say so. The benchmark did catch a real regression the gate
+structurally could not: a thread-count cutoff that made small corpora *slower*
+while every answer stayed correct. Correctness gating and benchmarking are not
+substitutes for one another.
 """
 from __future__ import annotations
 
@@ -160,8 +164,8 @@ RATIO_TOL = 0.005                                # ~6 sd of the measured ratio
 
 # -- threading configuration --------------------------------------------- #
 #
-# hamming_distances bypasses the pool entirely below _MIN_ROWS_PER_THREAD rows
-# per worker, so a threading check run at N=4000 collapses to one worker and
+# hamming_distances bypasses the pool entirely below _MIN_BYTES_PER_THREAD of
+# code per worker, so a threading check run at N=4000 collapses to one worker and
 # certifies nothing while reporting PASS. The gating skill's warning about
 # known-bads validated at a small/fast setting applies literally here: the
 # dropped-block defect is invisible at a size where no block is ever
@@ -169,21 +173,34 @@ RATIO_TOL = 0.005                                # ~6 sd of the measured ratio
 # library's own bypass rule rather than from a number typed in here, and
 # `_kb_dropped_block` is validated at that size.
 #
-# d is 64 rather than 256 to keep the float sign-disagreement anchor (an
-# (N_T, d) @ (d, d) matmul, computed twice) affordable at this row count --
-# --self-test re-runs the whole gate once per simulated defect.
-D_T = 64
+# The codes there are random and the anchor is np.unpackbits rather than the
+# float sign-disagreement reference: keeping four workers busy needs ~8 MB of
+# codes, and the float array those would be encoded from is 32x that, with two
+# (n, d) @ (d, d) matmuls on top. See unpackbits_distances().
+B_T = 64        # 512-bit codes
 THREAD_COUNTS = (2, 3, 4, 7)
 
-#: Rows in the threading corpus. The offset is 139, not a round number and not
-#: the 137 this started at: 4*16384+137 = 65673 = 3 * 21891, so at T=3 the
-#: naive ``n // T`` split covers every row and is *not a defect at all*. The
-#: known-bad below reported ACCEPTED for that thread count and turned the gate
-#: red, which is the check on the gate working: a dropped-tail case validated
-#: only at a dividing thread count would have certified nothing. 139 keeps n
-#: indivisible by every count in THREAD_COUNTS, and the known-bad now asserts
-#: that rather than assuming it.
-N_T = 4 * packing_mod._MIN_ROWS_PER_THREAD + 139
+#: Rows in the threading corpus. Sized from the library's own bypass rule so
+#: the two cannot drift: enough bytes to keep 4 workers past
+#: ``_MIN_BYTES_PER_THREAD``, plus a remainder no thread count divides.
+#:
+#: The offset is *computed*, not typed, and that is the interesting part. A
+#: dropped-tail defect only exists when T does not divide n — so a hand-picked
+#: offset that happens to be divisible makes the known-bad genuinely not bad at
+#: that thread count. This has now happened twice: 4*16384+137 = 65673 = 3 x
+#: 21891 under the old row-based threshold, and then 4*32768+139 = 131211, also
+#: divisible by 3, when the threshold moved to bytes. Both times the known-bad
+#: reported ACCEPTED at T=3 and turned the gate red — the check on the gate
+#: doing its job — and both times the obvious fix was another hand-picked
+#: number that would break again on the next threshold change. Searching for
+#: the offset makes the property hold by construction; the known-bad still
+#: asserts it rather than trusting this.
+_BASE_T = 4 * (packing_mod._MIN_BYTES_PER_THREAD // B_T)
+N_T = next(
+    _BASE_T + off
+    for off in range(1, 1000)
+    if all((_BASE_T + off) % t for t in THREAD_COUNTS)
+)
 
 # -- blocked-scan configuration ------------------------------------------ #
 # Block sizes chosen so none divides N and one is smaller than K: a merge that
@@ -218,6 +235,32 @@ def angles(X: np.ndarray, q: np.ndarray) -> np.ndarray:
     xn = X / np.linalg.norm(X, axis=1, keepdims=True)
     qn = q / np.linalg.norm(q)
     return np.arccos(np.clip(xn @ qn, -1.0, 1.0))
+
+
+def unpackbits_distances(codes: np.ndarray, query: np.ndarray) -> np.ndarray:
+    """Hamming distance via ``np.unpackbits`` — the definition, in pure numpy.
+
+    The anchor for the threading corpus. The float sign-disagreement reference
+    cannot be used there: keeping four workers past ``_MIN_BYTES_PER_THREAD``
+    needs ~8 MB of *codes*, and the float array those codes would be encoded
+    from is 32x that, with two (n, d) @ (d, d) matmuls on top — tens of
+    GFLOP, re-run once per simulated defect by ``--self-test``.
+
+    So the codes are random and the anchor is bit-level instead of geometric:
+    expand every byte to its 8 bits and count the ones in the XOR. No packing
+    trick, no popcount LUT, no C kernel, nothing from remax at all — numpy's
+    own ``unpackbits`` against the arithmetic definition of Hamming distance.
+    Chunked so the (n, 8B) expansion stays bounded.
+    """
+    n = codes.shape[0]
+    out = np.empty(n, dtype=np.int64)
+    step = 1 << 15
+    for start in range(0, n, step):
+        block = codes[start : start + step]
+        out[start : start + block.shape[0]] = np.unpackbits(
+            np.bitwise_xor(block, query[None, :]), axis=1
+        ).sum(axis=1, dtype=np.int64)
+    return out
 
 
 def file_bytes(path: Path, offset: int, length: int) -> np.ndarray:
@@ -760,12 +803,9 @@ def run_gate() -> int:
     # every thread count collapses to one worker and these checks would be
     # green without a thread ever running.
     rng_t = np.random.default_rng(SEED + 1)
-    X_t = rng_t.standard_normal((N_T, D_T)).astype(np.float32)
-    quant_t = remax.SignBitQuantizer(d=D_T, seed=SEED)
-    codes_t = quant_t.encode(X_t)
-    q_t = X_t[0]
-    qc_t = quant_t.encode(q_t)
-    expected_t = reference_distances(X_t, q_t, SEED)
+    codes_t = rng_t.integers(0, 256, size=(N_T, B_T), dtype=np.uint8)
+    qc_t = rng_t.integers(0, 256, size=B_T, dtype=np.uint8)
+    expected_t = unpackbits_distances(codes_t, qc_t)
 
     packing_mod._pools.clear()
     serial_t = np.asarray(
@@ -773,9 +813,9 @@ def run_gate() -> int:
     )
     g.check(
         np.array_equal(serial_t, expected_t),
-        "serial scan on the threading corpus matches the float reference "
-        "[anchor: sign-disagreement count]",
-        f"n={N_T} d={D_T}",
+        "serial scan on the threading corpus matches the unpackbits count "
+        "[anchor: np.unpackbits(a ^ b).sum(1), no remax code in the path]",
+        f"n={N_T} B={B_T} ({codes_t.nbytes / 1e6:.1f} MB of codes)",
     )
     thread_ok = {}
     poison_left = {}
@@ -788,9 +828,9 @@ def run_gate() -> int:
         poison_left[t] = int((buf == -9999).sum())
     g.check(
         all(thread_ok.values()),
-        "the threaded scan equals the float sign-disagreement reference at "
-        f"every thread count in {THREAD_COUNTS} "
-        "[anchor: (sign(X@R) != sign(q@R)).sum(1)]",
+        "the threaded scan equals the unpackbits reference at every thread "
+        f"count in {THREAD_COUNTS} "
+        "[anchor: np.unpackbits(a ^ b).sum(1)]",
         f"n={N_T} (divisible by none of them); per-thread agreement "
         f"{thread_ok}",
     )
@@ -805,8 +845,8 @@ def run_gate() -> int:
         "the pool was actually used (a check that collapses to one worker "
         "certifies nothing)",
         f"pools created: {sorted(packing_mod._pools)}; "
-        f"_MIN_ROWS_PER_THREAD={packing_mod._MIN_ROWS_PER_THREAD}, "
-        f"n={N_T}",
+        f"_MIN_BYTES_PER_THREAD={packing_mod._MIN_BYTES_PER_THREAD}, "
+        f"codes={codes_t.nbytes / 1e6:.1f} MB, n={N_T}",
     )
     g.check(
         packing_mod.get_default_threads() == 1,
@@ -1074,7 +1114,7 @@ def run_gate() -> int:
     )
 
     g.note(f"corpus n={N} d={D} batch m={M} k={K} seed={SEED}")
-    g.note(f"threading corpus n={N_T} d={D_T} threads={THREAD_COUNTS}")
+    g.note(f"threading corpus n={N_T} B={B_T} threads={THREAD_COUNTS}")
     g.note(f"native kernel available: {remax.NATIVE_AVAILABLE}")
 
     mm.close()
@@ -1223,7 +1263,7 @@ def _kb_dropped_block(g, codes_t, qc_t, expected_t) -> None:
                f"correct ({sum(w for _, w in worst.values())} wrong), which "
                f"is why comparing only the scanned rows would accept this",
         covers=("every row is written by some thread",
-                "the threaded scan equals the float sign-disagreement",
+                "the threaded scan equals the unpackbits reference",
                 "serial scan on the threading corpus matches",
                 "the pool was actually used"),
     )
