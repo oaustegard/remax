@@ -12,7 +12,8 @@ Reports: median/best per-query ms, queries/sec, index size MB.
 Data sources (embedding caches):
   - $SCRATCH/emb/{scifact_docs,scifact_queries}.npy
   - $SCRATCH/data/scifact_subset.json
-where $SCRATCH = /tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad
+where $SCRATCH resolves via bench/nemotron_paths.py:
+  $NEMOTRON_SCRATCH, else $SCRATCH, else bench/.cache/nemotron
 
 Outputs:
   - /home/user/remax/bench/results/nemotron_latency.csv
@@ -48,6 +49,7 @@ except ImportError:
     repo_root = Path(__file__).resolve().parent.parent
     sys.path.insert(0, str(repo_root / "src"))
     from remax import SignBitQuantizer, StackedSignBitQuantizer, hamming_distances
+from remax.packing import stable_top_k  # noqa: E402  (library's own O(n) top-k)
 
 # Try to import faiss
 try:
@@ -63,12 +65,10 @@ try:
 except ImportError:
     pass
 
-SCRATCH = Path(
-    "/tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad"
-)
-DATA_DIR = SCRATCH / "data"
-EMB_DIR = SCRATCH / "emb"
-RESULTS_DIR = Path(__file__).resolve().parent / "results"
+# Cache paths come from bench/nemotron_paths.py so every nemotron script
+# resolves them the same way and all of them honour NEMOTRON_SCRATCH.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nemotron_paths import DATA_DIR, EMB_DIR, RESULTS_DIR, SCRATCH  # noqa: E402
 
 BASE_DIM = 2048
 QUANTIZER_SEED = 0
@@ -87,26 +87,86 @@ def slice_renorm(emb: np.ndarray, d: int) -> np.ndarray:
     return out
 
 
+# ── harness fairness ────────────────────────────────────────────────────────
+#
+# READ THIS BEFORE QUOTING ANY NUMBER OUT OF THIS FILE.
+#
+# The original harness did not give the two arms the same treatment, and the
+# mismatch ran entirely one way — in the baseline's favour:
+#
+#   float32:  scores = queries @ corpus.T          ONE batched GEMM, all 300
+#             np.argsort(-scores, axis=1)[:, :k]   ONE batched sort
+#
+#   remax:    for i in range(m):                   a Python loop, 300 calls
+#                 hamming_distances(codes, q[i])
+#                 np.argsort(distances)[:k]        a FULL O(n log n) sort,
+#                                                  per query
+#
+# Three separate advantages, none of them a property of either algorithm:
+#
+#   1. The float32 arm amortises Python and dispatch overhead over 300
+#      queries; the remax arm pays it 300 times.
+#   2. BLAS on a (300, d) x (d, n) GEMM blocks the corpus and reuses it in
+#      cache across all 300 queries. A per-query loop rereads the index 300
+#      times.
+#   3. remax was denied its own top-k. The library ships stable_top_k, an
+#      argpartition-based O(n) selector; the harness called np.argsort, which
+#      sorts all n. At n=5183, k=10 that is most of the remaining work.
+#
+# `mode` is now an explicit axis: both arms implement both modes, and both use
+# an O(n) selector. The batched/per-query gap is a real and interesting number
+# — it is what tells you whether your workload should batch — but it belongs
+# to the harness, so it has to be visible rather than baked into one arm.
+
+
+def _topk_desc(scores: np.ndarray, k: int) -> np.ndarray:
+    """Top-k by descending score with O(n) selection.
+
+    The float32 counterpart of remax's ``stable_top_k``, so neither arm is
+    left holding a full sort while the other is not.
+    """
+    k = min(k, scores.shape[-1])
+    part = np.argpartition(-scores, k - 1, axis=-1)[..., :k]
+    if scores.ndim == 1:
+        return part[np.argsort(-scores[part])]
+    rows = np.arange(scores.shape[0])[:, None]
+    return np.take_along_axis(
+        part, np.argsort(-scores[rows, part], axis=1), axis=1
+    )
+
+
 def benchmark_float32_matmul(
-    corpus: np.ndarray, queries: np.ndarray, k: int
+    corpus: np.ndarray, queries: np.ndarray, k: int, mode: str = "batched"
 ) -> tuple[float, float, float]:
     """Benchmark float32 matmul retrieval.
 
+    mode="batched"    one GEMM over all m queries — throughput-shaped
+    mode="per_query"  one query at a time — latency-shaped, and the shape the
+                      remax arm was measured in before this became an axis
+
     Returns: (per_query_ms_median, per_query_ms_best, queries_per_sec)
     """
-    m, n = queries.shape[0], corpus.shape[0]
+    m = queries.shape[0]
 
-    # Warmup
-    scores = queries @ corpus.T
-    _ = np.argsort(-scores, axis=1)[:, :k]
+    if mode == "batched":
+        def run():
+            scores = queries @ corpus.T
+            _topk_desc(scores, k)
+    elif mode == "per_query":
+        def run():
+            for i in range(m):
+                scores = queries[i] @ corpus.T
+                _topk_desc(scores, k)
+    else:
+        raise ValueError(f"unknown mode {mode!r}")
+
+    run()  # warmup
 
     times = []
     for _ in range(NUM_REPEATS):
         start = time.perf_counter()
-        scores = queries @ corpus.T
-        _ = np.argsort(-scores, axis=1)[:, :k]
-        elapsed = time.perf_counter() - start
-        times.append(elapsed)
+        run()
+        times.append(time.perf_counter() - start)
 
     total_queries = m * NUM_REPEATS
     per_query_ms_median = float(np.median(times) / m * 1000)
@@ -158,33 +218,59 @@ def benchmark_int8_matmul(
 
 
 def benchmark_remax_hamming(
-    corpus: np.ndarray, queries: np.ndarray, k: int, k_stack: int = 1
+    corpus: np.ndarray, queries: np.ndarray, k: int, k_stack: int = 1,
+    mode: str = "batched",
 ) -> tuple[float, float, float]:
-    """Benchmark remax hamming distance scan."""
+    """Benchmark the remax Hamming scan.
+
+    Same two modes as the float32 arm, and ``stable_top_k`` rather than
+    ``np.argsort`` — the library's own O(n) selector, which the original
+    harness did not call. See the "harness fairness" note above.
+
+    ``mode`` is accepted for symmetry with the float32 arm but both values
+    time the *same* work, and that is the point rather than an oversight:
+    **remax has no batched Hamming kernel.** ``search`` loops over queries in
+    Python whichever way you call it (an m-way SIMD popcount is explicitly
+    post-v0.1.0). Reporting a "batched" remax number that merely moved the
+    loop inside the library would manufacture a distinction that does not
+    exist in the code — and calling ``quant.search(queries, ...)`` here would
+    be worse than that, because it drags a (m, d) x (d, d) rotation GEMM for
+    all m queries inside the timer while the float32 arm has no encode step
+    at all.
+
+    Query encoding is therefore excluded from the timed region, as in the
+    original harness, so these numbers stay comparable to the published ones.
+    That exclusion favours remax and is stated in NEMOTRON_1BIT.md.
+    """
+    if mode not in ("batched", "per_query"):
+        raise ValueError(f"unknown mode {mode!r}")
+
     d = corpus.shape[1]
-    m, n = queries.shape[0], corpus.shape[0]
+    m = queries.shape[0]
 
     if k_stack == 1:
-        q = SignBitQuantizer(d=d, seed=QUANTIZER_SEED)
-        corpus_codes = q.encode(corpus)
-        query_codes = q.encode(queries)
+        quant = SignBitQuantizer(d=d, seed=QUANTIZER_SEED)
     else:
-        sq = StackedSignBitQuantizer(d=d, k=k_stack, seed=QUANTIZER_SEED)
-        corpus_codes = sq.encode(corpus)
-        query_codes = sq.encode(queries)
+        quant = StackedSignBitQuantizer(d=d, k=k_stack, seed=QUANTIZER_SEED)
+    corpus_codes = quant.encode(corpus)
+    query_codes = quant.encode(queries)
 
-    # Warmup
-    for i in range(min(5, m)):
-        _ = hamming_distances(corpus_codes, query_codes[i])
+    scratch = np.empty(corpus_codes.shape[0], dtype=np.int32)
+
+    def run():
+        for i in range(m):
+            distances = hamming_distances(
+                corpus_codes, query_codes[i], out=scratch
+            )
+            stable_top_k(distances, k)
+
+    run()  # warmup
 
     times = []
     for _ in range(NUM_REPEATS):
         start = time.perf_counter()
-        for i in range(m):
-            distances = hamming_distances(corpus_codes, query_codes[i])
-            _ = np.argsort(distances)[:k]
-        elapsed = time.perf_counter() - start
-        times.append(elapsed)
+        run()
+        times.append(time.perf_counter() - start)
 
     total_queries = m * NUM_REPEATS
     per_query_ms_median = float(np.median(times) / m * 1000)

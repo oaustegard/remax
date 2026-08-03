@@ -7,7 +7,8 @@ are quantized to 1-bit with the remax library, compared to float32 baselines
 Data sources (embedding caches + qrels/gold):
   - $SCRATCH/emb/{scifact_docs,scifact_queries,stsb_s1,stsb_s2}.npy
   - $SCRATCH/data/{scifact_subset,stsb_test}.json
-where $SCRATCH = /tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad
+where $SCRATCH resolves via bench/nemotron_paths.py:
+  $NEMOTRON_SCRATCH, else $SCRATCH, else bench/.cache/nemotron
 
 Outputs:
   - /home/user/remax/bench/results/nemotron_1bit.csv
@@ -41,17 +42,10 @@ except ImportError:
     from remax import SignBitQuantizer, StackedSignBitQuantizer, hamming_distances
 
 
-SCRATCH = Path(
-    os.environ.get(
-        "NEMOTRON_SCRATCH",
-        "/tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad",
-    )
-)
-# Env overrides let the published cache (fetch_nemotron_cache.sh) drop in
-# without editing paths; default to the session scratch dir.
-DATA_DIR = Path(os.environ.get("NEMOTRON_DATA_DIR", SCRATCH / "data"))
-EMB_DIR = Path(os.environ.get("NEMOTRON_EMB_DIR", SCRATCH / "emb"))
-RESULTS_DIR = Path(__file__).resolve().parent / "results"
+# Cache paths come from bench/nemotron_paths.py so every nemotron script
+# resolves them the same way and all of them honour NEMOTRON_SCRATCH.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nemotron_paths import DATA_DIR, EMB_DIR, RESULTS_DIR, SCRATCH  # noqa: E402
 
 # Contract: base embedding dimension
 BASE_DIM = 2048

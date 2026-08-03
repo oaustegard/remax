@@ -7,7 +7,8 @@ deterministic float32 baseline rows.
 Data sources (embedding caches + qrels/gold):
   - $SCRATCH/emb/{scifact_docs,scifact_queries,stsb_s1,stsb_s2}.npy
   - $SCRATCH/data/{scifact_subset,stsb_test}.json
-where $SCRATCH = /tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad
+where $SCRATCH resolves via bench/nemotron_paths.py:
+  $NEMOTRON_SCRATCH, else $SCRATCH, else bench/.cache/nemotron
 
 Outputs:
   - /home/user/remax/bench/results/nemotron_seeds.csv

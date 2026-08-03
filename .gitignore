@@ -12,6 +12,7 @@ venv/
 .env
 
 # Bench artifacts
+# also the default nemotron embedding cache — see bench/nemotron_paths.py
 bench/.cache/
 bench/results/*
 !bench/results/.gitkeep

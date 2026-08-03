@@ -39,13 +39,9 @@ from pathlib import Path
 
 import numpy as np
 
-SCRATCH = Path(
-    os.environ.get(
-        "NEMOTRON_SCRATCH",
-        "/tmp/claude-0/-home-user/17f19a5d-a832-5512-bd5c-e28bcfa2ca35/scratchpad",
-    )
-)
-DATA_DIR = Path(os.environ.get("NEMOTRON_DATA_DIR", SCRATCH / "data"))
+# Shared resolution — see bench/nemotron_paths.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nemotron_paths import DATA_DIR, SCRATCH  # noqa: E402
 EMB_DIR = Path(os.environ.get("NVFP4_EMB_DIR", SCRATCH / "emb_nvfp4"))
 DEQUANT_DIR = Path(os.environ.get("NVFP4_DEQUANT_DIR", SCRATCH / "nvfp4_dequant"))
 NVFP4_MODEL = "nvidia/Nemotron-3-Embed-1B-NVFP4"
