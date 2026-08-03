@@ -56,6 +56,9 @@ _CANDIDATES = [
     os.environ.get("GATING_SKILL_DIR"),
     "/tmp/gating-skill/scripts",
     "/mnt/skills/user/gating/scripts",
+    # Vendored fallback (bench/gates/gate.py) so gates run in CI, where no
+    # skill directory is mounted. A real skill checkout still wins.
+    str(Path(__file__).resolve().parent),
 ]
 for _c in _CANDIDATES:
     if _c and (Path(_c) / "gate.py").exists():
