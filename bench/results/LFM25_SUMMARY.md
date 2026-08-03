@@ -132,17 +132,26 @@ SKETCH_MATRYOSHKA_GEMINI.md, so this is embedder-specific, not a general refutat
 **remax loses cleanly here.** At every matched budget where both compete, remex
 wins. This repo's 1-bit codes are the right tool on anisotropic encoders like
 SPECTER2; on LFM2.5 they are not. Same code, opposite curve — which is the standing
-conclusion of `docs/research/matryoshka-and-quantization.md` and now has a second
-confirming data point.
+conclusion of [`SKETCH_MATRYOSHKA.md`](SKETCH_MATRYOSHKA.md) and
+[`SKETCH_MATRYOSHKA_GEMINI.md`](SKETCH_MATRYOSHKA_GEMINI.md) (identical strategy
+sweep, two encoders, different winners) and now has a third confirming data point.
 
 > **Superseded, 2026-07-30.** The paragraph above attributed the remax/remex gap
 > to Lloyd-Max vs SimHash. That was wrong. The gap is **symmetric vs asymmetric
 > scoring**: remex decodes to float and takes an inner product, while remax's
 > `search` binarizes the query too. Giving remax an asymmetric path
 > (`search_asymmetric`, float query against the same sign-bit index) closes it
-> almost exactly — 0.7020 vs remex's 0.7018 at an identical 128 B/vec. See
-> `LFM25_ASYMMETRIC.md`. The codec comparison at matched bytes stands; the
-> explanation for it does not.
+> almost exactly — 0.7020 vs remex's 0.7018 at an identical 128 B/vec. The
+> numbers are in [Asymmetric scoring](#asymmetric-scoring) below, and the raw
+> run in [`lfm25_asymmetric.json`](lfm25_asymmetric.json). The codec comparison
+> at matched bytes stands; the explanation for it does not.
+>
+> (Until 2026-08-03 this paragraph pointed at a file named LFM25\_ASYMMETRIC,
+> which was never committed and does not appear anywhere in this repository's
+> history — so a correction rested on a citation that went nowhere. The data
+> had gone into the section below instead. The pointer now goes there rather
+> than to a new file, so there is one copy of these numbers rather than two
+> that can drift apart.)
 
 ## Asymmetric scoring
 
