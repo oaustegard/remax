@@ -7,7 +7,8 @@ Three primitives:
 * :func:`hamming_search` — top-k by Hamming distance for a single rotated query.
 
 When a C compiler is available, ``hamming_distances`` dispatches to a native
-kernel using hardware ``POPCNT`` (~50–60× faster than the NumPy LUT fallback).
+kernel using hardware ``POPCNT`` (~25–35× faster than the NumPy LUT fallback;
+the ratio depends on ``n`` and ``d`` — :mod:`remax._native` carries the table).
 The native path compiles automatically at first import and is cached; no extra
 dependencies are required.  See :mod:`remax._native` for details.
 """

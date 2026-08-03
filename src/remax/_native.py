@@ -25,8 +25,40 @@ a partially written library (CWE-367).
 Performance
 -----------
 On x86-64 with hardware ``POPCNT`` (any CPU from ~2008 onward), the native
-scan achieves ~10 GB/s effective throughput — roughly 50–60× faster than
-the NumPy LUT path, and within a factor of 2 of raw ``memcpy`` bandwidth.
+scan runs **roughly 25-35x faster than the NumPy LUT fallback**, at 5-11 GB/s
+effective throughput (index bytes scanned / elapsed).
+
+It is not a single number, and quoting it as one is what produced the two
+mutually exclusive figures this docstring and README.md used to carry
+("50-60x" here, "23x / 9.7 GB/s" there). The ratio moves with both ``n`` and
+``d``, because the two paths have different memory behaviour: the NumPy path
+materialises an ``(n, B)`` uint16 gather -- 2 bytes of intermediate per input
+byte, so it touches ~3x the index and leaves cache early -- while the native
+path streams the index once and writes 4 bytes per row.
+
+Measured on an Intel Xeon @ 2.80 GHz, numpy 2.4, min of 9 runs
+(``bench/native_speedup.py``):
+
+    ==========  ========  ========  ============
+    n           d=768     d=256     GB/s (d=768)
+    ==========  ========  ========  ============
+    10,000      32.9x     24.9x     10.8
+    100,000     34.9x     32.2x     10.0
+    1,000,000   33.5x     27.7x      6.8
+    ==========  ========  ========  ============
+
+Throughput falls off between 100k and 1M because that is where the index
+stops fitting in last-level cache; past that point the scan is bandwidth-
+bound, which is the regime the design targets.
+
+The old "within a factor of 2 of raw memcpy bandwidth" line is gone rather
+than restated. It compared unlike traffic: memcpy moves ``2*n*B`` bytes
+(read and write) where this scan reads ``n*B`` and writes ``4n``, so the
+comparison can be made to say almost anything. ``bench/native_speedup.py``
+still prints a memcpy column, labelled as a scale reference, not headroom.
+
+Reproduce with ``python3 bench/native_speedup.py [--d D] [--sizes N ...]``.
+These are hardware-specific; re-measure before quoting them elsewhere.
 """
 
 from __future__ import annotations

@@ -28,7 +28,7 @@ Future work is tracked in [issues](https://github.com/oaustegard/remax/issues). 
 - `Corpus` — packed binary codes + SQLite metadata sidecar. Maps array indices to record IDs with JSON metadata per record. [Postgres recipe](docs/postgres-recipe.md) included.
 - `characterize()` — sweep a strategy × k grid on your encoder and get a recommended operating point.
 - Rotation choice — `rotation="haar"` (default, Haar-distributed QR) or `rotation="rht"` (randomized Hadamard, 1.5–1.8× faster to build). Measured equivalent for retrieval; see [`ROTATION_LSH.md`](bench/results/ROTATION_LSH.md) for why a structured rotation needed re-measuring here rather than inheriting remex's result, and for the single-round construction it rules out.
-- Native Hamming scan — C extension compiled at first import with hardware POPCNT. 23× over NumPy (9.7 GB/s effective throughput, within 1.3× of memcpy ceiling).
+- Native Hamming scan — C extension compiled at first import with hardware POPCNT. **25–35× over the NumPy LUT fallback**, 5–11 GB/s effective throughput. The ratio depends on `n` and `d` — 33× at n=1M/d=768, 28× at n=1M/d=256 — because the NumPy path materialises a uint16 gather ~3× the size of the index while the native path streams it once. Throughput drops from ~10 GB/s to ~7 GB/s between n=100k and n=1M, where the index outgrows last-level cache. Measured on an Intel Xeon @ 2.80 GHz; reproduce with `python3 bench/native_speedup.py`.
 
 **Benchmark suite** (`bench/`):
 - [`BASELINE.md`](bench/results/BASELINE.md) — R@10 vs float32 ground truth across the stacked precision ladder. 1-bit: 0.635, k=2: 0.676, k=4: 0.706, k=8: 0.718.
