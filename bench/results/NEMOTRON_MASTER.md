@@ -88,15 +88,12 @@ BF16 twin stands in for the NVFP4 activation path; two datasets on one model
 family (a signal, not a benchmark sweep); SciFact is a 1600-doc subset. remex/PQ
 store a float32 norm per vector (+4 B), included in their byte counts.
 
-## Reproduce
+## Provenance
 
-```bash
-bash bench/fetch_nemotron_cache.sh          # embeddings (skip the ~1h encode)
-python3 bench/nvfp4_dequant_encode.py build && python3 bench/nvfp4_dequant_encode.py encode
-python3 bench/eval_nemotron_1bit.py         # remax grid
-python3 bench/eval_nemotron_seeds.py        # remax mean±std
-python3 bench/remex_nemotron.py             # Lloyd-Max 2/3/4-bit
-python3 bench/baselines_nemotron.py         # int8 + PQ
-python3 bench/nvfp4_eval.py                 # NVFP4 quality + composition
-python3 bench/plot_nemotron_master.py       # -> nemotron_master.png
-```
+The ten scripts that produced these CSVs were **deleted on 2026-08-03** — they
+benchmarked a third-party embedder, not remax, and were the largest block of
+Python in the repository. The CSVs, the PNG and the prose here are the record.
+[`NEMOTRON_1BIT.md`](NEMOTRON_1BIT.md#provenance--the-drivers-are-gone-the-results-are-not)
+carries the full artifact→script mapping and how to recover a driver from git
+history. `bench/fetch_nemotron_cache.sh` is kept: it is the pointer to the
+published embeddings the whole family read.

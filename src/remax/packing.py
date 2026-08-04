@@ -4,7 +4,6 @@ Three primitives:
 
 * :func:`encode_signs` — already-rotated floats → bit-packed ``uint8`` codes.
 * :func:`hamming_distances` — broadcast XOR + popcount-LUT sum over a corpus.
-* :func:`hamming_search` — top-k by Hamming distance for a single rotated query.
 
 When a C compiler is available, ``hamming_distances`` dispatches to a native
 kernel using hardware ``POPCNT`` (~25–35× faster than the NumPy LUT fallback;
@@ -27,6 +26,23 @@ Threading is **off by default** (``threads=None`` → :func:`get_default_threads
 worker pool is a bad neighbour. Opt in per call (``threads=4``,
 ``threads="auto"``), process-wide (:func:`set_default_threads`), or by
 environment (``REMAX_THREADS=auto``).
+
+Removed, 2026-08-03: ``hamming_search`` and ``asymmetric_search``
+-----------------------------------------------------------------
+Two single-query top-k wrappers used to live here and were exported from
+``remax``. Nothing in the library ever called them: every search path
+(:meth:`SignBitQuantizer.search`, ``SignBitQuantizer.search_asymmetric``, and
+the stacked equivalents) composes ``hamming_distances`` / ``asymmetric_scores``
+with ``stable_top_k`` directly, because it needs the batch loop and the
+reusable output buffer the wrappers did not provide.
+
+They were also the more dangerous of the two spellings: both took an
+**already-rotated** query, so a caller passing a raw vector got plausible wrong
+answers rather than an error, and neither accepted a batch. Use the quantizer
+methods. If you genuinely want the functional form, it is one line each::
+
+    order = stable_top_k(hamming_distances(codes, encode_signs(q @ R)), k)
+    order = stable_top_k(-asymmetric_scores(q @ R, codes), k)
 """
 
 from __future__ import annotations
@@ -46,13 +62,11 @@ __all__ = [
     "NonContiguousCodesWarning",
     "as_codes",
     "asymmetric_scores",
-    "asymmetric_search",
     "asymmetric_tables",
     "counting_top_k",
     "encode_signs",
     "get_default_threads",
     "hamming_distances",
-    "hamming_search",
     "hamming_topk_batch",
     "resolve_threads",
     "scores_from_table",
@@ -715,45 +729,6 @@ def stable_top_k(
     return cand[np.argsort(dists[cand], kind="stable")][:k_eff]
 
 
-def hamming_search(
-    query_rotated: np.ndarray,
-    codes: np.ndarray,
-    k: int = 10,
-    *,
-    return_distances: bool = False,
-):
-    """Top-k Hamming search given an already-rotated query.
-
-    Parameters
-    ----------
-    query_rotated : np.ndarray, shape (d,)
-        Already-rotated query (caller is responsible for ``query @ R``).
-    codes : np.ndarray, shape (n, d // 8), dtype uint8
-        Bit-packed corpus produced by :func:`encode_signs`.
-    k : int
-        Number of neighbours to return.
-    return_distances : bool, keyword-only
-        If True, also return the Hamming distances of the top-k.
-
-    Returns
-    -------
-    indices : np.ndarray, shape (k,), dtype intp
-        Indices into ``codes``, sorted ascending by Hamming distance.
-    distances : np.ndarray, shape (k,), dtype int64
-        (Only if ``return_distances=True``.)
-    """
-    if k <= 0:
-        raise ValueError(f"k must be positive, got {k}")
-    q_code = encode_signs(np.asarray(query_rotated))
-    if q_code.ndim != 1:
-        raise ValueError("query_rotated must be a single 1-D vector")
-    dists = hamming_distances(codes, q_code)
-    order = stable_top_k(dists, k)
-    if return_distances:
-        return order, dists[order]
-    return order
-
-
 # ── blocked multi-query scan ─────────────────────────────────────────────────
 #
 # The m-query loop in SignBitQuantizer.search reads the whole corpus once per
@@ -1087,20 +1062,3 @@ def asymmetric_scores(
     tables, offsets = asymmetric_tables(q, n_bytes)
     return scores_from_table(tables[0], codes, float(offsets[0]), chunk=chunk)
 
-
-def asymmetric_search(
-    query_rotated: np.ndarray,
-    codes: np.ndarray,
-    k: int = 10,
-    *,
-    return_scores: bool = False,
-):
-    """Top-k by asymmetric dot product. Mirrors :func:`hamming_search`."""
-    if k <= 0:
-        raise ValueError(f"k must be positive, got {k}")
-    scores = asymmetric_scores(query_rotated, codes)
-    # stable_top_k is ascending, and higher score is better here.
-    order = stable_top_k(-scores, k)
-    if return_scores:
-        return order, scores[order]
-    return order

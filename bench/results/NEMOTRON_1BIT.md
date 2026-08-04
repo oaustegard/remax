@@ -201,23 +201,35 @@ connected to the evidence offered for it.
 - **Memory in absolute terms.** A 1M-vector Nemotron index is 8.0 GB at float32, 256 MB at 1-bit (32×), 32 MB at 1-bit-on-256-slice (256×). The 32× point is the sweet spot: it fits an index 32× larger in the same RAM at a −0.02 nDCG cost. At n = 1,600 that memory win does not yet translate to a *speed* win (the flat float scan is already sub-40 µs); the latency crossover is a large-n regime this experiment doesn't reach.
 - **Caveat — BF16 proxy, single model.** All numbers are on the BF16 embeddings; the NVFP4 checkpoint (GPU + vLLM) was not run here. remax quantizes the emitted vectors and is orthogonal to NVFP4 weight quantization, but that composition is argued, not measured. Two datasets on one model family — a signal, not a benchmark sweep.
 
-## Reproduce
+## Provenance — the drivers are gone, the results are not
 
-```bash
-# Skip the ~1h CPU encode by fetching the published embedding cache:
-bash bench/fetch_nemotron_cache.sh   # -> bench/.cache/NEMOTRON/{emb,data}
-export NEMOTRON_EMB_DIR=bench/.cache/NEMOTRON/emb NEMOTRON_DATA_DIR=bench/.cache/NEMOTRON/data
-# ...or encode from scratch:
-python3 bench/embed_nemotron.py            # encode SciFact + STS-B (CPU, resumable)
+**The ten Nemotron/NVFP4 bench scripts were deleted on 2026-08-03** (4,650 lines,
+including the shared `nemotron_paths.py`). This file, `NEMOTRON_MASTER.md`, the
+committed CSVs and the committed PNGs are the record, and they are complete: every
+number quoted above has its row in a CSV in this directory.
 
-python3 bench/eval_nemotron_1bit.py        # -> nemotron_1bit.csv   (headline grid)
-python3 bench/eval_nemotron_seeds.py       # -> nemotron_seeds.csv  (mean±std, seeds 0-4)
-python3 bench/baselines_nemotron.py        # -> nemotron_baselines.csv (int8 + PQ)
-python3 bench/latency_nemotron.py          # -> nemotron_latency.csv
-python3 bench/plot_nemotron_1bit.py        # -> nemotron_1bit.png
-# offline selftests (no model/network) — every script supports --selftest:
-for s in embed eval plot; do python3 bench/${s}_nemotron*.py --selftest; done
-python3 bench/eval_nemotron_seeds.py --selftest
-python3 bench/baselines_nemotron.py --selftest
-python3 bench/latency_nemotron.py --selftest
-```
+They went because they were apparatus, not library. They benchmark a third-party
+embedder (`nvidia/Nemotron-3-Embed-1B-BF16`) rather than anything in `src/remax/`,
+they were the largest single block of Python in the repository, and re-running
+them needs a model, a ~1 h CPU encode or a published embedding cache, `remex`, and
+`matplotlib` — so nobody was running them anyway.
+
+| what produced what | removed script |
+|---|---|
+| `nemotron_1bit.csv`, `nemotron_1bit.png` | `eval_nemotron_1bit.py`, `plot_nemotron_1bit.py` |
+| `nemotron_seeds.csv` (mean±std, seeds 0-4) | `eval_nemotron_seeds.py` |
+| `nemotron_baselines.csv`, `nemotron_baselines.png` | `baselines_nemotron.py` |
+| `nemotron_latency.csv` | `latency_nemotron.py` (see the correction above — this one was measuring the harness) |
+| `nemotron_remex.csv` | `remex_nemotron.py` |
+| `nemotron_nvfp4.csv` | `nvfp4_eval.py`, `nvfp4_dequant_encode.py` |
+| `nemotron_master.png` | `plot_nemotron_master.py` |
+| the embeddings all of the above read | `embed_nemotron.py` |
+
+The published embedding cache still exists and `bench/fetch_nemotron_cache.sh` is
+kept, because it is the pointer to the raw data — release tag
+`nemotron-3-embed-1b-bf16` on `oaustegard/claude-container-layers`, with the array
+shapes it verifies documented in the script. Recovering a driver is
+`git log --diff-filter=D -- bench/eval_nemotron_1bit.py` and then `git show`.
+
+Before restoring any of them, be clear about which question is still open. The
+conclusions above are not among them.

@@ -33,11 +33,9 @@ import numpy as np
 from .packing import (
     as_codes,
     asymmetric_scores,
-    asymmetric_search,
     asymmetric_tables,
     encode_signs,
     hamming_distances,
-    hamming_search,
     hamming_topk_batch,
     scores_from_table,
     stable_top_k,
@@ -51,12 +49,10 @@ _ASYM_TABLE_BUDGET = 64 << 20
 __all__ = [
     "SignBitQuantizer",
     "asymmetric_scores",
-    "asymmetric_search",
     "haar_rotation",
     "rht_rotation",
     "encode_signs",
     "hamming_distances",
-    "hamming_search",
 ]
 
 

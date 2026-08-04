@@ -2,11 +2,19 @@
 
 ## Unreleased
 
-Query-path throughput. Every change here is **bit-identical** to what it
-replaces: the scan stays exhaustive, there is still no cell assignment, no
-multi-probe and no candidate pruning, so recall is unchanged by construction
-rather than by tolerance. `bench/gates/query_path_gate.py` is what holds that,
-and it now proves itself against 14 simulated defects rather than 8.
+Two independent lines of work: query-path throughput, and a consolidation pass
+that removed about a fifth of the Python in the repository.
+
+Everything in the throughput half is **bit-identical** to what it replaces —
+the scan stays exhaustive, there is still no cell assignment, no multi-probe
+and no candidate pruning, so recall is unchanged by construction rather than
+by tolerance. `bench/gates/query_path_gate.py` is what holds that, and it now
+proves itself against 14 simulated defects rather than 8.
+
+The consolidation half **removes two exported functions**; see
+*Removed — breaking* below.
+
+## Unreleased — query path
 
 ### Added
 
@@ -76,6 +84,71 @@ recorded where they happened:
   kernel at m=1 than at m=8. Pre-existing, unrelated to the table hoist, and
   worth knowing before someone else spends an afternoon on it.
 
+## Unreleased — consolidation
+
+### Removed — breaking
+
+- **`remax.hamming_search` and `remax.asymmetric_search` are gone.** Both were
+  thin wrappers the library itself declined to use: every internal caller went
+  straight to `hamming_distances` + `stable_top_k`. They were exported in
+  `__all__`, so this is a breaking change for anyone who imported them — it is
+  the reason this section exists rather than being folded into a patch note.
+  The two-line functional equivalent is recorded in `packing.py`'s module
+  docstring, so the replacement is in the file where the removal happened.
+
+  Note they shipped in **v0.1.0**, so code pinned to that tag is unaffected.
+
+- **The benchmark harness no longer ships inside the wheel.** `src/remax/bench/`
+  moved to the top-level `bench/` (git-mv, history preserved). A built wheel now
+  contains eight `remax/*.py` modules and no benchmark code; `remax.bench`
+  becomes a `ModuleNotFoundError` on a fresh install. Both
+  `python bench/run_baseline.py` and `python -m bench.run_baseline` still work
+  from a checkout. No `pyproject.toml` change was needed — `packages.find`
+  scoped to `src/` is exactly what keeps a top-level `bench/` out of the wheel.
+
+- **Ten Nemotron / NVFP4 benchmark drivers deleted** (~4,645 lines). They were
+  unrunnable outside the session that wrote them. **Every conclusion is kept**:
+  `bench/results/NEMOTRON_1BIT.md`, `bench/results/NEMOTRON_MASTER.md`,
+  all CSVs and PNGs, and
+  `fetch_nemotron_cache.sh` — which is the pointer to the raw embeddings, i.e.
+  a record rather than a driver. Both markdowns gained a "Provenance" section
+  mapping each surviving artifact to the script that produced it, with the git
+  command to recover it.
+
+Total: Python in the repository goes from 22,635 to 17,756 lines (−21.6%).
+
+### Added
+
+- **`bench/results/LFM25_LEARNED_ROTATION.md`** — a result that existed only as
+  raw JSON. ITQ beats the Haar default by **+0.0200** symmetric nDCG@10 at an
+  identical 128 B/vec. The sharper finding is the negative one: free-W
+  straight-through achieved the **lowest quantization error of anything tested**
+  (922.23 vs ITQ's 972.60) and the **worst retrieval** (−0.1805), with
+  orthogonality error 98.4 — the learned map stopped being a rotation.
+  **Minimizing quantization error is not the objective.** Under holdout, ITQ's
+  asymmetric gain inverts (+0.0048 → −0.0042): that part was memorization.
+  Not shipped, for three reasons stated in the writeup — asymmetric scoring
+  buys more (+0.0248) for free and the two do not compose; the matrix is
+  4.19 MB, or 32,768 vectors' worth of codes; and it would end
+  data-obliviousness, since `(d, seed)` would no longer reproduce the index.
+
+- **`bench/results/LFM25_FINETUNE.md`** — CPU fine-tuning feasibility, with the
+  overfit signal made explicit: held-out nDCG peaks at **one** epoch and
+  declines by three while training loss falls 8×. LoRA is only 1.37× faster
+  than a full fine-tune here, because 10 of 16 LFM2 layers are convolutional
+  and PEFT cannot wrap them. Two artefacts the raw JSON hides are flagged
+  rather than repeated: the feasibility run's peak-RSS column is a single
+  process-wide high-water mark misattributed across three rows, and the
+  frozen-classifier F1 numbers come from synthetic `--demo` data.
+
+### Changed
+
+- `CLAUDE.md`'s anti-goals list claimed "Numba / SIMD popcount", "C/C++
+  bindings" and "disk format spec" were out of scope. All three had already
+  been overridden by merged code — `_native.py` compiles a C kernel with
+  `-mpopcnt` at import, and `corpus.py` specifies a `RMAX` magic-byte format.
+  The list is now a table of overrides with the justification each one met, so
+  the document describes the project that exists.
 ## v0.1.0 — 2026-08-03
 
 First tagged release. The library has been importable and useful for a while;

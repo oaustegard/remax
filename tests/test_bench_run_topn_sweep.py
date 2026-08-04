@@ -1,4 +1,4 @@
-"""Tests for ``remax.bench.run_topn_sweep`` — PR #22 follow-up.
+"""Tests for ``bench.run_topn_sweep`` — PR #22 follow-up.
 
 The sweep is a thin loop around :func:`run_rerank_experiment` that hits
 each top_n in a ladder and reports recall + latency at each step. These
@@ -17,8 +17,8 @@ import pytest
 
 pytest.importorskip("matplotlib")
 
-from remax.bench import datasets, run_topn_sweep
-from remax.bench.run_topn_sweep import (
+from bench import datasets, run_topn_sweep
+from bench.run_topn_sweep import (
     DEFAULT_TOPN_LADDER,
     _parse_top_ns,
     _plateau_top_n,

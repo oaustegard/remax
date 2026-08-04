@@ -6,7 +6,7 @@ Public surface (v0.1.0 in progress):
 * :class:`StackedSignBitQuantizer` — k-stack precision ladder
   (variance ∝ 1/k, every step rank-correct).
 * Functional primitives: :func:`haar_rotation`, :func:`rht_rotation`,
-  :func:`encode_signs`, :func:`hamming_distances`, :func:`hamming_search`.
+  :func:`encode_signs`, :func:`hamming_distances`.
 * :func:`characterize` — encoder characterization utility; sweeps a
   strategy × k grid and reports the recommended operating point.
 
@@ -19,11 +19,9 @@ from .characterize import CharacterizeReport, characterize
 from .core import (
     SignBitQuantizer,
     asymmetric_scores,
-    asymmetric_search,
     encode_signs,
     haar_rotation,
     hamming_distances,
-    hamming_search,
     rht_rotation,
 )
 from .corpus import Corpus, Result
@@ -41,14 +39,12 @@ __all__ = [
     "SignBitQuantizer",
     "StackedSignBitQuantizer",
     "asymmetric_scores",
-    "asymmetric_search",
     "Corpus",
     "Result",
     "haar_rotation",
     "rht_rotation",
     "encode_signs",
     "hamming_distances",
-    "hamming_search",
     "characterize",
     "CharacterizeReport",
     "NATIVE_AVAILABLE",

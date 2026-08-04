@@ -1,4 +1,4 @@
-"""Tests for ``remax.bench.eval`` — recall@K computation and float32 ground truth.
+"""Tests for ``bench.eval`` — recall@K computation and float32 ground truth.
 
 Required by issue #4:
 
@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 from remax import SignBitQuantizer, StackedSignBitQuantizer
-from remax.bench.eval import (
+from bench.eval import (
     exact_knn,
     recall_at_k,
     evaluate_quantizer,

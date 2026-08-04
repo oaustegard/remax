@@ -59,6 +59,11 @@ KNOWN_EXTERNAL: dict[str, str] = {
     # BM25_SKETCH.md is the negative result and names what it removed.
     "src/remax/bm25.py": "removed with the sparse path; BM25_SKETCH.md is its negative result",
     "src/remax/sparse.py": "removed with the sparse path; BM25_SKETCH.md is its negative result",
+    # The Nemotron/NVFP4 drivers were deleted 2026-08-03 (third-party embedder,
+    # not remax). Their conclusions live in NEMOTRON_1BIT.md + NEMOTRON_MASTER.md
+    # + the committed CSVs, which name the removed scripts on purpose — a result
+    # should say what produced it even after the producer is gone.
+    "bench/latency_nemotron.py": "removed with the Nemotron drivers; NEMOTRON_1BIT.md cites it as the subject of a harness-bug correction",
 }
 
 _LINK = re.compile(r"(?<!!)\[[^\]]*\]\(\s*([^)\s]+)")
