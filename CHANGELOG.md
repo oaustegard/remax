@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-Two independent lines of work: query-path throughput, and a consolidation pass
-that removed about a fifth of the Python in the repository.
+Two independent lines of work landed together: query-path throughput, and a
+consolidation pass that removed about a fifth of the Python in the repository.
 
 Everything in the throughput half is **bit-identical** to what it replaces —
 the scan stays exhaustive, there is still no cell assignment, no multi-probe
@@ -11,10 +11,8 @@ and no candidate pruning, so recall is unchanged by construction rather than
 by tolerance. `bench/gates/query_path_gate.py` is what holds that, and it now
 proves itself against 14 simulated defects rather than 8.
 
-The consolidation half **removes two exported functions**; see
-*Removed — breaking* below.
-
-## Unreleased — query path
+The consolidation half **removes two exported functions**. See
+*Removed — breaking*.
 
 ### Added
 
@@ -52,6 +50,28 @@ The consolidation half **removes two exported functions**; see
   what makes each pair of arms comparable, and which corpus sizes were
   actually run.
 
+- **`bench/results/LFM25_LEARNED_ROTATION.md`** — a result that existed only as
+  raw JSON. ITQ beats the Haar default by **+0.0200** symmetric nDCG@10 at an
+  identical 128 B/vec. The sharper finding is the negative one: free-W
+  straight-through achieved the **lowest quantization error of anything tested**
+  (922.23 vs ITQ's 972.60) and the **worst retrieval** (−0.1805), with
+  orthogonality error 98.4 — the learned map stopped being a rotation.
+  **Minimizing quantization error is not the objective.** Under holdout, ITQ's
+  asymmetric gain inverts (+0.0048 → −0.0042): that part was memorization.
+  Not shipped, for three reasons stated in the writeup — asymmetric scoring
+  buys more (+0.0248) for free and the two do not compose; the matrix is
+  4.19 MB, or 32,768 vectors' worth of codes; and it would end
+  data-obliviousness, since `(d, seed)` would no longer reproduce the index.
+
+- **`bench/results/LFM25_FINETUNE.md`** — CPU fine-tuning feasibility, with the
+  overfit signal made explicit: held-out nDCG peaks at **one** epoch and
+  declines by three while training loss falls 8×. LoRA is only 1.37× faster
+  than a full fine-tune here, because 10 of 16 LFM2 layers are convolutional
+  and PEFT cannot wrap them. Two artefacts the raw JSON hides are flagged
+  rather than repeated: the feasibility run's peak-RSS column is a single
+  process-wide high-water mark misattributed across three rows, and the
+  frozen-classifier F1 numbers come from synthetic `--demo` data.
+
 ### Changed
 
 - **The m-query loop is blocked.** `SignBitQuantizer.search` and the new
@@ -64,27 +84,12 @@ The consolidation half **removes two exported functions**; see
 - **`search_asymmetric` builds all m byte tables in one batched GEMM** before
   its loop rather than one small GEMM per iteration. Bit-identical.
 
-### Notes
-
-Three things found by the gate and the benchmark rather than by review, all
-recorded where they happened:
-
-- The first thread-count cutoff was **16384 rows**, which at B=32 is 512 KB —
-  well inside the region where threading measures 0.5–0.8x, i.e. a slowdown.
-  The correctness gate is structurally unable to see this: the answers were
-  right the whole time. The cutoff is now 2 MB of code *per thread*, derived
-  from the measured dispatch cost (~60 µs) against the ~9.7 GB/s single-core
-  scan rate.
-- The dropped-tail known-bad reported **ACCEPTED** twice, at thread counts
-  that happened to divide the corpus size exactly — where the naive `n // T`
-  split is genuinely correct and the "known-bad" is not bad at all. The gate's
-  corpus size is now searched for rather than typed.
-- Batched and single-query `search_asymmetric` scores already differed in the
-  last ulp on v0.1.0, because `query @ rotation_` selects a different BLAS
-  kernel at m=1 than at m=8. Pre-existing, unrelated to the table hoist, and
-  worth knowing before someone else spends an afternoon on it.
-
-## Unreleased — consolidation
+- `CLAUDE.md`'s anti-goals list claimed "Numba / SIMD popcount", "C/C++
+  bindings" and "disk format spec" were out of scope. All three had already
+  been overridden by merged code — `_native.py` compiles a C kernel with
+  `-mpopcnt` at import, and `corpus.py` specifies a `RMAX` magic-byte format.
+  The list is now a table of overrides with the justification each one met, so
+  the document describes the project that exists.
 
 ### Removed — breaking
 
@@ -117,38 +122,26 @@ recorded where they happened:
 
 Total: Python in the repository goes from 22,635 to 17,756 lines (−21.6%).
 
-### Added
+### Notes
 
-- **`bench/results/LFM25_LEARNED_ROTATION.md`** — a result that existed only as
-  raw JSON. ITQ beats the Haar default by **+0.0200** symmetric nDCG@10 at an
-  identical 128 B/vec. The sharper finding is the negative one: free-W
-  straight-through achieved the **lowest quantization error of anything tested**
-  (922.23 vs ITQ's 972.60) and the **worst retrieval** (−0.1805), with
-  orthogonality error 98.4 — the learned map stopped being a rotation.
-  **Minimizing quantization error is not the objective.** Under holdout, ITQ's
-  asymmetric gain inverts (+0.0048 → −0.0042): that part was memorization.
-  Not shipped, for three reasons stated in the writeup — asymmetric scoring
-  buys more (+0.0248) for free and the two do not compose; the matrix is
-  4.19 MB, or 32,768 vectors' worth of codes; and it would end
-  data-obliviousness, since `(d, seed)` would no longer reproduce the index.
+Three things found by the gate and the benchmark rather than by review, all
+recorded where they happened:
 
-- **`bench/results/LFM25_FINETUNE.md`** — CPU fine-tuning feasibility, with the
-  overfit signal made explicit: held-out nDCG peaks at **one** epoch and
-  declines by three while training loss falls 8×. LoRA is only 1.37× faster
-  than a full fine-tune here, because 10 of 16 LFM2 layers are convolutional
-  and PEFT cannot wrap them. Two artefacts the raw JSON hides are flagged
-  rather than repeated: the feasibility run's peak-RSS column is a single
-  process-wide high-water mark misattributed across three rows, and the
-  frozen-classifier F1 numbers come from synthetic `--demo` data.
+- The first thread-count cutoff was **16384 rows**, which at B=32 is 512 KB —
+  well inside the region where threading measures 0.5–0.8x, i.e. a slowdown.
+  The correctness gate is structurally unable to see this: the answers were
+  right the whole time. The cutoff is now 2 MB of code *per thread*, derived
+  from the measured dispatch cost (~60 µs) against the ~9.7 GB/s single-core
+  scan rate.
+- The dropped-tail known-bad reported **ACCEPTED** twice, at thread counts
+  that happened to divide the corpus size exactly — where the naive `n // T`
+  split is genuinely correct and the "known-bad" is not bad at all. The gate's
+  corpus size is now searched for rather than typed.
+- Batched and single-query `search_asymmetric` scores already differed in the
+  last ulp on v0.1.0, because `query @ rotation_` selects a different BLAS
+  kernel at m=1 than at m=8. Pre-existing, unrelated to the table hoist, and
+  worth knowing before someone else spends an afternoon on it.
 
-### Changed
-
-- `CLAUDE.md`'s anti-goals list claimed "Numba / SIMD popcount", "C/C++
-  bindings" and "disk format spec" were out of scope. All three had already
-  been overridden by merged code — `_native.py` compiles a C kernel with
-  `-mpopcnt` at import, and `corpus.py` specifies a `RMAX` magic-byte format.
-  The list is now a table of overrides with the justification each one met, so
-  the document describes the project that exists.
 ## v0.1.0 — 2026-08-03
 
 First tagged release. The library has been importable and useful for a while;
