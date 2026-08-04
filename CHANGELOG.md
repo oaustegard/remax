@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## v0.2.0 — 2026-08-04
+
 Two independent lines of work landed together: query-path throughput, and a
 consolidation pass that removed about a fifth of the Python in the repository.
 
