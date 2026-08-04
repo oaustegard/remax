@@ -1,4 +1,4 @@
-"""Tests for ``remax.bench.datasets`` — cache-path resolution and loaders.
+"""Tests for ``bench.datasets`` — cache-path resolution and loaders.
 
 Real embeddings (SPECTER2, MiniLM-L6-v2, GloVe-300d) live in a per-dataset
 cache under ``bench/.cache/<NAME>/embeddings.npy``. The dataset module
@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from remax.bench import datasets
+from bench import datasets
 
 
 # --------------------------------------------------------------------- #

@@ -193,6 +193,24 @@ Two consequences worth acting on:
 If you are scoring asymmetrically, spend bytes on k=4 or not at all — k=2 is a
 dominated configuration on this embedder.
 
+## Follow-on runs on this encoder
+
+Both are recorded rejections — the measurement is the asset, neither changed the
+library.
+
+- [`LFM25_LEARNED_ROTATION.md`](LFM25_LEARNED_ROTATION.md) — a data-dependent
+  rotation (ITQ) beats the Haar default by +0.0200 symmetric nDCG@10 at the same
+  128 B/vec, but that is *less* than asymmetric scoring buys for free (+0.0248),
+  the two barely compose, the asymmetric part does not survive a holdout fit, and
+  the matrix costs 4.19 MB — 32,768 vectors' worth of codes. Also contains the
+  straight-through failure: lowest quantization error of anything tested, worst
+  retrieval, orthogonality error 98.
+- [`LFM25_FINETUNE.md`](LFM25_FINETUNE.md) — what adapting the encoder costs on
+  CPU (10.8-14.8 h for the cookbook recipe; LoRA only 1.37x faster than full)
+  and what it buys on 221 retrieval pairs (held-out nDCG peaks at *one* epoch).
+  Notes one result that touches remax directly: the fine-tune shrank the
+  quantization penalty from 0.0228 to 0.0055 while fp32 held-out quality fell.
+
 ## Scope and limits
 
 - One dataset (SciFact), one seed, 300 queries. Differences under ~0.005 nDCG are

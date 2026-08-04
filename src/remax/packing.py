@@ -4,13 +4,30 @@ Three primitives:
 
 * :func:`encode_signs` — already-rotated floats → bit-packed ``uint8`` codes.
 * :func:`hamming_distances` — broadcast XOR + popcount-LUT sum over a corpus.
-* :func:`hamming_search` — top-k by Hamming distance for a single rotated query.
+* :func:`stable_top_k` — deterministic top-k over a distance/score vector.
 
 When a C compiler is available, ``hamming_distances`` dispatches to a native
 kernel using hardware ``POPCNT`` (~25–35× faster than the NumPy LUT fallback;
 the ratio depends on ``n`` and ``d`` — :mod:`remax._native` carries the table).
 The native path compiles automatically at first import and is cached; no extra
 dependencies are required.  See :mod:`remax._native` for details.
+
+Removed, 2026-08-03: ``hamming_search`` and ``asymmetric_search``
+-----------------------------------------------------------------
+Two single-query top-k wrappers used to live here and were exported from
+``remax``. Nothing in the library ever called them: every search path
+(:meth:`SignBitQuantizer.search`, ``SignBitQuantizer.search_asymmetric``, and
+the stacked equivalents) composes ``hamming_distances`` / ``asymmetric_scores``
+with ``stable_top_k`` directly, because it needs the batch loop and the
+reusable output buffer the wrappers did not provide.
+
+They were also the more dangerous of the two spellings: both took an
+**already-rotated** query, so a caller passing a raw vector got plausible wrong
+answers rather than an error, and neither accepted a batch. Use the quantizer
+methods. If you genuinely want the functional form, it is one line each::
+
+    order = stable_top_k(hamming_distances(codes, encode_signs(q @ R)), k)
+    order = stable_top_k(-asymmetric_scores(q @ R, codes), k)
 """
 
 from __future__ import annotations
@@ -27,7 +44,6 @@ __all__ = [
     "as_codes",
     "encode_signs",
     "hamming_distances",
-    "hamming_search",
     "stable_top_k",
 ]
 
@@ -245,45 +261,6 @@ def stable_top_k(dists: np.ndarray, k: int) -> np.ndarray:
     return cand[np.argsort(dists[cand], kind="stable")][:k_eff]
 
 
-def hamming_search(
-    query_rotated: np.ndarray,
-    codes: np.ndarray,
-    k: int = 10,
-    *,
-    return_distances: bool = False,
-):
-    """Top-k Hamming search given an already-rotated query.
-
-    Parameters
-    ----------
-    query_rotated : np.ndarray, shape (d,)
-        Already-rotated query (caller is responsible for ``query @ R``).
-    codes : np.ndarray, shape (n, d // 8), dtype uint8
-        Bit-packed corpus produced by :func:`encode_signs`.
-    k : int
-        Number of neighbours to return.
-    return_distances : bool, keyword-only
-        If True, also return the Hamming distances of the top-k.
-
-    Returns
-    -------
-    indices : np.ndarray, shape (k,), dtype intp
-        Indices into ``codes``, sorted ascending by Hamming distance.
-    distances : np.ndarray, shape (k,), dtype int64
-        (Only if ``return_distances=True``.)
-    """
-    if k <= 0:
-        raise ValueError(f"k must be positive, got {k}")
-    q_code = encode_signs(np.asarray(query_rotated))
-    if q_code.ndim != 1:
-        raise ValueError("query_rotated must be a single 1-D vector")
-    dists = hamming_distances(codes, q_code)
-    order = stable_top_k(dists, k)
-    if return_distances:
-        return order, dists[order]
-    return order
-
-
 # ── asymmetric scoring ───────────────────────────────────────────────────────
 #
 # Hamming search binarizes BOTH sides. That is symmetric and cheap, but the
@@ -361,21 +338,3 @@ def asymmetric_scores(
         block = codes[start : start + chunk]
         out[start : start + len(block)] = table[cols, block].sum(axis=1)
     return 2.0 * out - q.sum(dtype=np.float32)
-
-
-def asymmetric_search(
-    query_rotated: np.ndarray,
-    codes: np.ndarray,
-    k: int = 10,
-    *,
-    return_scores: bool = False,
-):
-    """Top-k by asymmetric dot product. Mirrors :func:`hamming_search`."""
-    if k <= 0:
-        raise ValueError(f"k must be positive, got {k}")
-    scores = asymmetric_scores(query_rotated, codes)
-    # stable_top_k is ascending, and higher score is better here.
-    order = stable_top_k(-scores, k)
-    if return_scores:
-        return order, scores[order]
-    return order

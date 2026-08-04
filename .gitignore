@@ -11,21 +11,25 @@ htmlcov/
 venv/
 .env
 
-# Bench artifacts
-# also the default nemotron embedding cache — see bench/nemotron_paths.py
+# ── Bench artifacts ──────────────────────────────────────────────────────────
+# bench/results/ is ignored by default and every committed artifact is
+# whitelisted below, one line each. Keep the groups together: the list used to
+# run on past the "# IDE" section at the bottom of this file, which made it look
+# finished three times over.
 bench/.cache/
 bench/results/*
 !bench/results/.gitkeep
+
+# SPECTER2 / synthetic harness — bench/run_baseline.py, crossover.py, run_rerank.py
 !bench/results/BASELINE.md
-!bench/results/SKETCH_MATRYOSHKA.md
-!bench/results/SKETCH_MATRYOSHKA_GEMINI.md
 !bench/results/CROSSOVER.md
 !bench/results/crossover.csv
 !bench/results/crossover.png
 !bench/results/RERANK.md
-# NOT YET GENERATED (checked 2026-08-03). These three are the output triple of
-# bench/run_topn_sweep.py; the whitelist was added ahead of the run and the run
-# has never been committed, so nothing in bench/results/ matches them today.
+
+# NOT YET GENERATED (re-checked 2026-08-03). These three are the output triple
+# of bench/run_topn_sweep.py; the whitelist was added ahead of the run and the
+# run has never been committed, so nothing in bench/results/ matches them today.
 # Producing them needs the ONNX cross-encoder plus the SPECTER2 embedding cache.
 # Kept rather than deleted so the artifacts land in git when someone does the
 # run — but do not read these lines as evidence the files exist. Nothing else
@@ -33,18 +37,23 @@ bench/results/*
 !bench/results/RERANK_topn_sweep.md
 !bench/results/rerank_topn_sweep.csv
 !bench/results/rerank_topn_sweep.png
+
+# Matryoshka sweeps + the sparse/BM25 negative result
+!bench/results/SKETCH_MATRYOSHKA.md
+!bench/results/SKETCH_MATRYOSHKA_GEMINI.md
 !bench/results/BM25_SKETCH.md
 !bench/results/BM25_FOLLOWUP.md
-!bench/results/JINA_V5_BEIR.md
-!bench/results/jina_v5_beir.csv
 !bench/results/ROTATION_LSH.md
 
-# IDE
-.vscode/
-.idea/
-*.swp
-.DS_Store
+# jina-v5 on BEIR
+!bench/results/JINA_V5_BEIR.md
+!bench/results/jina_v5_beir.csv
+
+# Nemotron-3-Embed-1B. The ten drivers were deleted 2026-08-03; these are the
+# whole record now, so nothing here is regenerable in-repo. See the Provenance
+# section of NEMOTRON_1BIT.md. Cache fetcher: bench/fetch_nemotron_cache.sh.
 !bench/results/NEMOTRON_1BIT.md
+!bench/results/NEMOTRON_MASTER.md
 !bench/results/nemotron_1bit.csv
 !bench/results/nemotron_1bit.png
 !bench/results/nemotron_seeds.csv
@@ -54,11 +63,14 @@ bench/results/*
 !bench/results/nemotron_nvfp4.csv
 !bench/results/nemotron_remex.csv
 !bench/results/nemotron_master.png
-!bench/results/NEMOTRON_MASTER.md
+
+# LFM2.5-Embedding-350M on BEIR SciFact
 !bench/results/LFM25_SUMMARY.md
 !bench/results/LFM25_SCIFACT.md
 !bench/results/LFM25_MATCHED_BYTES.md
 !bench/results/LFM25_RERANK.md
+!bench/results/LFM25_LEARNED_ROTATION.md
+!bench/results/LFM25_FINETUNE.md
 !bench/results/lfm25_scifact.json
 !bench/results/lfm25_rerank.json
 !bench/results/lfm25_pareto.png
@@ -70,3 +82,9 @@ bench/results/*
 !bench/results/lfm25_finetune_feasibility.json
 !bench/results/lfm25_finetune_retrieval.json
 !bench/results/lfm25_finetune_retrieval_1epoch.json
+
+# ── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store

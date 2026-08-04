@@ -1,4 +1,4 @@
-"""Tests for ``remax.bench.run_rerank`` — orchestrator and CLI.
+"""Tests for ``bench.run_rerank`` — orchestrator and CLI.
 
 The orchestrator is exercised end-to-end on a small synthetic corpus with a
 fake cross-encoder so the suite stays offline. A real-model integration
@@ -16,9 +16,9 @@ import json
 import numpy as np
 import pytest
 
-from remax.bench import datasets, run_rerank
-from remax.bench.rerank import CrossEncoderReranker
-from remax.bench.run_rerank import (
+from bench import datasets, run_rerank
+from bench.rerank import CrossEncoderReranker
+from bench.run_rerank import (
     QUERY_SPLIT_SEED,
     format_rerank_md,
     run_rerank_experiment,
