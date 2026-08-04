@@ -28,6 +28,30 @@ obviously safe in review:
 None of those raise. All four return correctly-shaped, entirely plausible
 output. That is the failure mode this gate is aimed at.
 
+Four more landed later, all of them "make the exhaustive scan faster without
+changing what it returns", and all of them with the same shape of failure:
+
+* The native scan was **threaded** — ctypes releases the GIL, so row blocks
+  dispatch to a pool. A split written as ``n // T`` rows per block drops the
+  ``n % T`` tail, and those rows keep whatever was in the output buffer:
+  plausible distances, for a corpus that quietly shrank.
+* ``stable_top_k`` gained a **counting (histogram) select** for integer
+  distances. It documents byte-for-byte equivalence to
+  ``np.argsort(kind="stable")[:k]``, and remax PR #32 exists because a naive
+  argpartition broke exactly that. A counting select that takes the cutoff's
+  tie group from the wrong end returns the same k distances and different
+  documents.
+* ``Corpus`` gained **mmap residency**. An "mmap" that actually copies still
+  answers every query correctly — it just does not do the thing it claims; and
+  a memmap that is not C-contiguous turns the guard added in #63 into a
+  whole-index copy on every query while the open-time number still looks good.
+* The m-query loop was **blocked** so the corpus is read once per block for all
+  queries. A merge that forgets earlier blocks returns the last block's
+  neighbours: k results, right shape, right dtype, wrong documents.
+
+Speed is what motivated every one of these changes, and speed is NOT gated
+here. See the coverage notes and ``bench/results/QUERY_PATH_SPEED.md``.
+
 Anchors
 -------
 Nothing here compares the new code to the old code's saved output — that only
@@ -46,6 +70,15 @@ ever proves the code still does what it did.
 3. **SQLite read straight from the file** with an independent connection, so
    the metadata mapping is checked against the database rather than against
    the Corpus object's idea of it.
+4. **numpy's own stable sort.** ``np.argsort(kind="stable")[:k]`` is the
+   contract ``stable_top_k`` is written against, and it is a different
+   implementation by a different author — so it anchors the counting select
+   rather than merely agreeing with it.
+5. **The index file's bytes, read with plain ``open()``**, and a write to the
+   file observed *through* the mapping. A copy cannot see a later write; a
+   mapping must. That is a differential check on the residency claim itself,
+   not on the distances it produces — which are identical either way, and so
+   say nothing about whether anything was mapped.
 
 Running it red
 --------------
@@ -62,13 +95,18 @@ fails unless every one drives the gate to exit 1. That is the check on the
 gate, as distinct from the check on the code.
 
 Deliberately NOT gated: speed. There is no anchor for how fast this should
-run — see ``bench/native_speedup.py``, which is a benchmark and says so.
+run — see ``bench/query_path_speed.py`` and ``bench/native_speedup.py``, which
+are benchmarks and say so. The benchmark did catch a real regression the gate
+structurally could not: a thread-count cutoff that made small corpora *slower*
+while every answer stayed correct. Correctness gating and benchmarking are not
+substitutes for one another.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -124,6 +162,52 @@ CORR_SD = 0.0169
 CORR_FLOOR = round(CORR_MEAN - 6 * CORR_SD, 3)   # 0.536
 RATIO_TOL = 0.005                                # ~6 sd of the measured ratio
 
+# -- threading configuration --------------------------------------------- #
+#
+# hamming_distances bypasses the pool entirely below _MIN_BYTES_PER_THREAD of
+# code per worker, so a threading check run at N=4000 collapses to one worker and
+# certifies nothing while reporting PASS. The gating skill's warning about
+# known-bads validated at a small/fast setting applies literally here: the
+# dropped-block defect is invisible at a size where no block is ever
+# dispatched. So the threading checks get their own corpus, sized from the
+# library's own bypass rule rather than from a number typed in here, and
+# `_kb_dropped_block` is validated at that size.
+#
+# The codes there are random and the anchor is np.unpackbits rather than the
+# float sign-disagreement reference: keeping four workers busy needs ~8 MB of
+# codes, and the float array those would be encoded from is 32x that, with two
+# (n, d) @ (d, d) matmuls on top. See unpackbits_distances().
+B_T = 64        # 512-bit codes
+THREAD_COUNTS = (2, 3, 4, 7)
+
+#: Rows in the threading corpus. Sized from the library's own bypass rule so
+#: the two cannot drift: enough bytes to keep 4 workers past
+#: ``_MIN_BYTES_PER_THREAD``, plus a remainder no thread count divides.
+#:
+#: The offset is *computed*, not typed, and that is the interesting part. A
+#: dropped-tail defect only exists when T does not divide n — so a hand-picked
+#: offset that happens to be divisible makes the known-bad genuinely not bad at
+#: that thread count. This has now happened twice: 4*16384+137 = 65673 = 3 x
+#: 21891 under the old row-based threshold, and then 4*32768+139 = 131211, also
+#: divisible by 3, when the threshold moved to bytes. Both times the known-bad
+#: reported ACCEPTED at T=3 and turned the gate red — the check on the gate
+#: doing its job — and both times the obvious fix was another hand-picked
+#: number that would break again on the next threshold change. Searching for
+#: the offset makes the property hold by construction; the known-bad still
+#: asserts it rather than trusting this.
+_BASE_T = 4 * (packing_mod._MIN_BYTES_PER_THREAD // B_T)
+N_T = next(
+    _BASE_T + off
+    for off in range(1, 1000)
+    if all((_BASE_T + off) % t for t in THREAD_COUNTS)
+)
+
+# -- blocked-scan configuration ------------------------------------------ #
+# Block sizes chosen so none divides N and one is smaller than K: a merge that
+# only ever sees whole blocks, or that assumes a block can supply all k, breaks
+# on these and not on a round number.
+BLOCK_SIZES = (7, 333, 4001)
+
 
 # ── anchors ─────────────────────────────────────────────────────────────── #
 
@@ -151,6 +235,57 @@ def angles(X: np.ndarray, q: np.ndarray) -> np.ndarray:
     xn = X / np.linalg.norm(X, axis=1, keepdims=True)
     qn = q / np.linalg.norm(q)
     return np.arccos(np.clip(xn @ qn, -1.0, 1.0))
+
+
+def unpackbits_distances(codes: np.ndarray, query: np.ndarray) -> np.ndarray:
+    """Hamming distance via ``np.unpackbits`` — the definition, in pure numpy.
+
+    The anchor for the threading corpus. The float sign-disagreement reference
+    cannot be used there: keeping four workers past ``_MIN_BYTES_PER_THREAD``
+    needs ~8 MB of *codes*, and the float array those codes would be encoded
+    from is 32x that, with two (n, d) @ (d, d) matmuls on top — tens of
+    GFLOP, re-run once per simulated defect by ``--self-test``.
+
+    So the codes are random and the anchor is bit-level instead of geometric:
+    expand every byte to its 8 bits and count the ones in the XOR. No packing
+    trick, no popcount LUT, no C kernel, nothing from remax at all — numpy's
+    own ``unpackbits`` against the arithmetic definition of Hamming distance.
+    Chunked so the (n, 8B) expansion stays bounded.
+    """
+    n = codes.shape[0]
+    out = np.empty(n, dtype=np.int64)
+    step = 1 << 15
+    for start in range(0, n, step):
+        block = codes[start : start + step]
+        out[start : start + block.shape[0]] = np.unpackbits(
+            np.bitwise_xor(block, query[None, :]), axis=1
+        ).sum(axis=1, dtype=np.int64)
+    return out
+
+
+def file_bytes(path: Path, offset: int, length: int) -> np.ndarray:
+    """Read the index payload with plain ``open()`` — no numpy, no Corpus."""
+    with open(path, "rb") as f:
+        f.seek(offset)
+        return np.frombuffer(f.read(length), dtype=np.uint8)
+
+
+def poke_file(path: Path, offset: int, value: int) -> int:
+    """Write one byte into the file and return what was there before.
+
+    The differential half of the residency check. A mapping sees a later write
+    to the file; a copy taken at open time cannot. Distances are identical
+    under both, so nothing about the *results* can distinguish them — which is
+    exactly why "residency" needs a check aimed at the residency.
+    """
+    with open(path, "r+b") as f:
+        f.seek(offset)
+        old = f.read(1)[0]
+        f.seek(offset)
+        f.write(bytes([value]))
+        f.flush()
+        os.fsync(f.fileno())
+    return old
 
 
 def sqlite_ground_truth(db_path: str, rowids: list[int]) -> dict:
@@ -198,13 +333,13 @@ def _sim_out_buffer_not_rewritten() -> None:
     real = packing_mod.hamming_distances
     seen: set[int] = set()
 
-    def patched(codes, query_code, *, out=None):
+    def patched(codes, query_code, *, out=None, **kw):
         if out is not None:
             key = id(out)
             if key in seen:
                 return out          # stale distances from the previous query
             seen.add(key)
-        return real(codes, query_code, out=out)
+        return real(codes, query_code, out=out, **kw)
 
     packing_mod.hamming_distances = patched
     core_mod.hamming_distances = patched
@@ -256,7 +391,7 @@ def _sim_unstable_tie_breaking() -> None:
     are the rule. Unstable selection silently returns a different member of a
     tie group: same k results, same distances, different documents.
     """
-    def patched(dists, k):
+    def patched(dists, k, **kw):
         if k <= 0:
             raise ValueError(f"k must be positive, got {k}")
         n = dists.shape[0]
@@ -286,7 +421,7 @@ def _sim_native_reads_strided_pointer() -> None:
 
     real_native = remax._native.hamming_distances_native
 
-    def native_patched(codes, query_code, *, out=None):
+    def native_patched(codes, query_code, *, out=None, **kw):
         # Pre-fix native entry: no contiguity check, raw pointer straight in.
         codes = np.asarray(codes)
         n, B = codes.shape
@@ -310,7 +445,7 @@ def _sim_distance_is_constant() -> None:
     Agreement checks between two of our own paths cannot see this if both
     are patched; the closed-form collision anchor can.
     """
-    def patched(codes, query_code, *, out=None):
+    def patched(codes, query_code, *, out=None, **kw):
         n = codes.shape[0]
         if out is None:
             out = np.empty(n, dtype=np.int32)
@@ -319,6 +454,139 @@ def _sim_distance_is_constant() -> None:
 
     packing_mod.hamming_distances = patched
     core_mod.hamming_distances = patched
+
+
+def _sim_threading_drops_a_block() -> None:
+    """The row split written as ``n // T`` per block.
+
+    The obvious way to write it, and it silently drops the ``n % T`` tail: at
+    N_T=65673 with 7 workers that is 5 rows which are never scanned and keep
+    whatever the output buffer held. No exception, no shape change, and on a
+    freshly allocated buffer the leftover values are plausible small ints.
+    """
+    def patched(n, parts):
+        step = n // parts
+        return [(i * step, (i + 1) * step) for i in range(parts)]
+
+    packing_mod._row_blocks = patched
+
+
+def _sim_counting_select_tie_break() -> None:
+    """The cutoff's tie group taken from its END rather than its front.
+
+    ``dists == cutoff`` may hold for thousands of rows; only ``k - n_below`` of
+    them fit. Taking the LAST of them instead of the first returns the same k
+    distances, in the same order, for different documents — which is precisely
+    the argsort-stability contract remax PR #32 was opened to defend, broken in
+    a new place.
+    """
+    real = packing_mod._counting_top_k
+
+    def patched(dists, k, value_bound):
+        order = real(dists, k, value_bound)
+        if order.size == 0:
+            return order
+        cutoff = dists[order[-1]]
+        tail = order[dists[order] == cutoff]
+        if tail.size == 0:
+            return order
+        # same tie group, taken from the other end
+        all_tied = np.flatnonzero(dists == cutoff)
+        replacement = all_tied[-tail.size:]
+        out = order.copy()
+        out[dists[order] == cutoff] = replacement
+        return out
+
+    packing_mod._counting_top_k = patched
+
+
+def _sim_blocked_merge_forgets_earlier_blocks() -> None:
+    """The merge that keeps the newest block instead of merging with it.
+
+    ``run_idx, run_dist = new_idx, new_dist`` — one line, and it looks like
+    initialisation. The result is a late block's top-k: k neighbours, sorted
+    ascending by a real distance, entirely wrong past the first block.
+
+    Guarded by "this block already has k, why merge?", which is both the
+    excuse somebody would actually write and what keeps the output full
+    length. The unguarded version (``return new_idx[:k]`` always)
+    short-changes the final partial block and dies on a broadcast error —
+    that is a red, but a red by crash says only that the gate noticed
+    something violent. This one returns correctly-shaped, correctly-typed,
+    plausibly-sorted neighbours, which is the failure the gate has to catch
+    on its merits.
+
+    It fires only where the guard lets it: at block sizes >= k. At block=7
+    with k=10 no block can supply k on its own, so the real merge runs and
+    that block size is genuinely unaffected — visible in the check's
+    per-block detail line, and the reason the check sweeps block sizes
+    rather than testing one.
+    """
+    real = packing_mod._merge_topk
+
+    def patched(run_idx, run_dist, new_idx, new_dist, k):
+        if new_idx.size >= k:
+            return new_idx[:k], new_dist[:k]
+        return real(run_idx, run_dist, new_idx, new_dist, k)
+
+    packing_mod._merge_topk = patched
+
+
+def _sim_blocked_merge_order_swapped() -> None:
+    """The merge's two argument lists concatenated the other way round.
+
+    ``np.concatenate((new, run))`` instead of ``((run, new))``. The stable sort
+    then breaks ties toward the LATER block — so a tie between row 12 and row
+    3000 resolves to 3000. Identical k distances, identical shape, identical
+    dtype, different documents: the remax#32 failure again, one layer up. A
+    check on distances cannot see it.
+    """
+    def patched(run_idx, run_dist, new_idx, new_dist, k):
+        if run_idx.size == 0:
+            return new_idx[:k], new_dist[:k]
+        idx = np.concatenate((new_idx, run_idx))
+        dist = np.concatenate((new_dist, run_dist))
+        order = np.argsort(dist, kind="stable")
+        return idx[order][:k], dist[order][:k]
+
+    packing_mod._merge_topk = patched
+
+
+def _sim_mmap_silently_copies() -> None:
+    """``residency="mmap"`` that reads the file instead of mapping it.
+
+    Every distance, neighbour and record_id is identical — the bytes are the
+    same bytes. What is not identical is the thing the argument was added for:
+    open cost, resident footprint, and sharing between processes. A results
+    check cannot see this, which is why the gate pokes the file and looks
+    through the mapping.
+    """
+    real = corpus_mod._open_codes
+
+    def patched(bin_path, residency):
+        codes, n, d, seed = real(bin_path, residency)
+        return np.array(codes), n, d, seed  # a copy, wearing the same shape
+
+    corpus_mod._open_codes = patched
+
+
+def _sim_mmap_loses_contiguity() -> None:
+    """A memmap window that is not C-contiguous.
+
+    Costs nothing at open and everything per query: `as_codes` copies the whole
+    index on every call, so the open-time win is paid back many times over and
+    the residency benchmark still reports a win.
+    """
+    real = corpus_mod._open_codes
+
+    def patched(bin_path, residency):
+        codes, n, d, seed = real(bin_path, residency)
+        if residency == "mmap" and codes.shape[0] > 1:
+            doubled = np.repeat(np.asarray(codes), 2, axis=0)
+            codes = doubled[::2]         # same values, strided view
+        return codes, n, d, seed
+
+    corpus_mod._open_codes = patched
 
 
 SIMULATIONS = {
@@ -330,6 +598,13 @@ SIMULATIONS = {
     "unstable-tie-breaking": _sim_unstable_tie_breaking,
     "native-reads-strided-pointer": _sim_native_reads_strided_pointer,
     "distance-is-constant": _sim_distance_is_constant,
+    "threading-drops-a-block": _sim_threading_drops_a_block,
+    "counting-select-tie-break": _sim_counting_select_tie_break,
+    "blocked-merge-forgets-earlier-blocks":
+        _sim_blocked_merge_forgets_earlier_blocks,
+    "blocked-merge-order-swapped": _sim_blocked_merge_order_swapped,
+    "mmap-silently-copies": _sim_mmap_silently_copies,
+    "mmap-loses-contiguity": _sim_mmap_loses_contiguity,
 }
 
 
@@ -523,6 +798,222 @@ def run_gate() -> int:
         f"{2 * M + 5}+ metadata calls: {len(corpus._connections)}",
     )
 
+    # -- threaded scan ---------------------------------------------------- #
+    # Own corpus, sized from the library's own small-n bypass rule: at N=4000
+    # every thread count collapses to one worker and these checks would be
+    # green without a thread ever running.
+    rng_t = np.random.default_rng(SEED + 1)
+    codes_t = rng_t.integers(0, 256, size=(N_T, B_T), dtype=np.uint8)
+    qc_t = rng_t.integers(0, 256, size=B_T, dtype=np.uint8)
+    expected_t = unpackbits_distances(codes_t, qc_t)
+
+    packing_mod._pools.clear()
+    serial_t = np.asarray(
+        hamming_distances(codes_t, qc_t, threads=1), dtype=np.int64
+    )
+    g.check(
+        np.array_equal(serial_t, expected_t),
+        "serial scan on the threading corpus matches the unpackbits count "
+        "[anchor: np.unpackbits(a ^ b).sum(1), no remax code in the path]",
+        f"n={N_T} B={B_T} ({codes_t.nbytes / 1e6:.1f} MB of codes)",
+    )
+    thread_ok = {}
+    poison_left = {}
+    for t in THREAD_COUNTS:
+        buf = np.full(N_T, np.int32(-9999), dtype=np.int32)
+        got = np.asarray(
+            hamming_distances(codes_t, qc_t, out=buf, threads=t), dtype=np.int64
+        )
+        thread_ok[t] = bool(np.array_equal(got, expected_t))
+        poison_left[t] = int((buf == -9999).sum())
+    g.check(
+        all(thread_ok.values()),
+        "the threaded scan equals the unpackbits reference at every thread "
+        f"count in {THREAD_COUNTS} "
+        "[anchor: np.unpackbits(a ^ b).sum(1)]",
+        f"n={N_T} (divisible by none of them); per-thread agreement "
+        f"{thread_ok}",
+    )
+    g.check(
+        not any(poison_left.values()),
+        "every row is written by some thread — no block is dropped",
+        f"poisoned rows surviving, by thread count: {poison_left}. "
+        f"n % T = {[N_T % t for t in THREAD_COUNTS]}",
+    )
+    g.check(
+        bool(packing_mod._pools),
+        "the pool was actually used (a check that collapses to one worker "
+        "certifies nothing)",
+        f"pools created: {sorted(packing_mod._pools)}; "
+        f"_MIN_BYTES_PER_THREAD={packing_mod._MIN_BYTES_PER_THREAD}, "
+        f"codes={codes_t.nbytes / 1e6:.1f} MB, n={N_T}",
+    )
+    g.check(
+        packing_mod.get_default_threads() == 1,
+        "threading is off by default — a library that spawns threads inside "
+        "somebody else's pool is a bad neighbour",
+        f"get_default_threads()={packing_mod.get_default_threads()}",
+    )
+
+    # -- counting select -------------------------------------------------- #
+    # Anchored on numpy's own stable sort, which is the contract stable_top_k
+    # is written against and an implementation nobody here wrote.
+    rng_c = np.random.default_rng(SEED + 2)
+    tie_dense = rng_c.binomial(D, 0.5, size=40_000).astype(np.int32)
+    counting_ok = all(
+        np.array_equal(
+            packing_mod.counting_top_k(tie_dense, kk),
+            np.argsort(tie_dense, kind="stable")[:kk],
+        )
+        for kk in (1, K, 137, 5000)
+    )
+    g.check(
+        counting_ok,
+        "counting select equals argsort(kind='stable')[:k] on tie-dense "
+        "integer distances [anchor: numpy's stable sort]",
+        f"n=40000 alphabet=[0,{D}] k in (1, {K}, 137, 5000); "
+        f"distinct values present: {len(np.unique(tie_dense))}",
+    )
+    # The tie group at the cutoff, isolated. This is the remax#32 failure
+    # reproduced in a new place: same k distances, different documents.
+    tie_probe = np.full(20_000, 5, dtype=np.int32)
+    tie_probe[:K - 1] = 1
+    tie_order = packing_mod.counting_top_k(tie_probe, K)
+    g.check(
+        np.array_equal(tie_order, np.arange(K)),
+        "the cutoff's tie group is taken from its FRONT (lowest indices), "
+        "not from anywhere else in the group "
+        "[anchor: argsort(kind='stable')]",
+        f"{K - 1} rows below the cutoff, {20_000 - K + 1} tied at it; "
+        f"slot {K - 1} went to index {int(tie_order[-1])}, must be {K - 1}",
+    )
+    # Same data, both implementations, same permutation — the dispatch is an
+    # optimisation and must not be observable.
+    big = rng_c.binomial(D, 0.5, size=packing_mod.COUNTING_MIN_N + 777)
+    big = big.astype(np.int32)
+    g.check(
+        np.array_equal(
+            packing_mod.stable_top_k(big, K),
+            np.argsort(big, kind="stable")[:K],
+        )
+        and np.array_equal(
+            packing_mod.stable_top_k(big, K),
+            packing_mod.stable_top_k(big.astype(np.float64), K).astype(np.intp),
+        ),
+        "the counting and comparison paths return the identical permutation "
+        "above the dispatch threshold [anchor: argsort(kind='stable')]",
+        f"n={big.size} >= COUNTING_MIN_N={packing_mod.COUNTING_MIN_N}",
+    )
+    g.check(
+        np.array_equal(
+            np.asarray(quant.search(Q[0], codes, k=K)),
+            reference_topk(X, Q[0], SEED, K),
+        ),
+        "top-k through the live search path still matches the float "
+        "reference ranking [anchor: argsort of sign-disagreement counts]",
+        f"n={N} d={D} k={K}",
+    )
+
+    # -- blocked batch scan ----------------------------------------------- #
+    q_codes_all = quant.encode(Q)
+    blocked_ok = {}
+    for blk in BLOCK_SIZES:
+        idx_b, dist_b = packing_mod.hamming_topk_batch(
+            codes, q_codes_all, K, block=blk
+        )
+        blocked_ok[blk] = all(
+            np.array_equal(idx_b[i], reference_topk(X, Q[i], SEED, K))
+            for i in range(M)
+        )
+    g.check(
+        all(blocked_ok.values()),
+        "the blocked scan's top-k matches the float reference ranking at "
+        f"every block size in {BLOCK_SIZES} "
+        "[anchor: argsort of sign-disagreement counts]",
+        f"n={N} m={M} k={K}; per-block agreement {blocked_ok}. "
+        f"block={BLOCK_SIZES[0]} is smaller than k, so no single block can "
+        f"supply the answer",
+    )
+    unblocked_idx, unblocked_dist = packing_mod.hamming_topk_batch(
+        codes, q_codes_all, K, block=N
+    )
+    small_idx, small_dist = packing_mod.hamming_topk_batch(
+        codes, q_codes_all, K, block=333
+    )
+    g.check(
+        np.array_equal(unblocked_idx, small_idx)
+        and np.array_equal(unblocked_dist, small_dist),
+        "blocked and unblocked agree bit-for-bit, indices and distances",
+        f"differing rows: {int((unblocked_idx != small_idx).any(axis=1).sum())}"
+        f"/{M}",
+    )
+
+    # -- mmap residency --------------------------------------------------- #
+    mmap_dir = Path(tmp) / "mm"
+    shutil.copytree(Path(tmp) / "c", mmap_dir)
+    mm = remax.Corpus(mmap_dir, residency="mmap")
+    payload_off = corpus_mod._HEADER_LEN
+    on_disk = file_bytes(
+        mmap_dir / corpus_mod._BIN_NAME, payload_off, N * (D // 8)
+    ).reshape(N, D // 8)
+    g.check(
+        np.array_equal(np.asarray(mm.codes), on_disk),
+        "mmap codes equal the file's payload bytes "
+        "[anchor: plain open()/seek()/read(), no numpy, no Corpus]",
+        f"n={N} B={D // 8} bytes={N * (D // 8)}",
+    )
+    g.check(
+        mm.codes.flags["C_CONTIGUOUS"],
+        "the memmap window is C-contiguous (a strided one would copy the "
+        "whole index on every query through as_codes)",
+        f"flags: C={mm.codes.flags['C_CONTIGUOUS']} "
+        f"F={mm.codes.flags['F_CONTIGUOUS']}",
+    )
+    with warnings.catch_warnings(record=True) as mm_caught:
+        warnings.simplefilter("always")
+        mm_results = mm.search(Q, k=K)
+    g.check(
+        not any(
+            issubclass(w.category, NonContiguousCodesWarning) for w in mm_caught
+        ),
+        "searching an mmap corpus copies nothing (the #63 guard stays silent)",
+        f"warnings raised: {[w.category.__name__ for w in mm_caught] or 'none'}",
+    )
+    g.check(
+        all(
+            [r.record_id for r in mm_results[i]]
+            == [ids[j] for j in reference_topk(X, Q[i], SEED, K)]
+            for i in range(M)
+        ),
+        "mmap search returns the float reference ranking "
+        "[anchor: argsort of sign-disagreement counts]",
+        f"m={M} k={K}",
+    )
+    # The residency claim itself. Distances are identical whether the index was
+    # mapped or copied, so no results check can see the difference — poke the
+    # file and look through the mapping.
+    probe_off = payload_off + (N // 2) * (D // 8)
+    old_byte = int(np.asarray(mm.codes)[N // 2, 0])
+    poke_file(mmap_dir / corpus_mod._BIN_NAME, probe_off, old_byte ^ 0xFF)
+    sees_write = int(np.asarray(mm.codes)[N // 2, 0]) == (old_byte ^ 0xFF)
+    poke_file(mmap_dir / corpus_mod._BIN_NAME, probe_off, old_byte)
+    g.check(
+        sees_write,
+        "the mmap corpus is a view of the file, not a copy of it "
+        "[anchor: a byte written to the file with open('r+b'), observed "
+        "through the mapping]",
+        f"wrote 0x{old_byte ^ 0xFF:02x} at offset {probe_off}; mapping "
+        f"reported 0x{int(np.asarray(mm.codes)[N // 2, 0]):02x} after restore, "
+        f"saw the write: {sees_write}",
+    )
+    g.check(
+        remax.Corpus(mmap_dir).residency == "load"
+        and not isinstance(remax.Corpus(mmap_dir).codes, np.memmap),
+        "residency defaults to 'load' — the pre-existing behaviour is what an "
+        "unchanged caller still gets",
+        f"Corpus(path).residency={remax.Corpus(mmap_dir).residency!r}",
+    )
+
     # -- known-bads ------------------------------------------------------- #
     # Built from the real machinery and broken the way it would plausibly
     # break. `covers` names which checks each one has been shown to fire.
@@ -531,6 +1022,11 @@ def run_gate() -> int:
     _kb_silent_copy(g, strided, q0_code)
     _kb_wrong_row(g, corpus, positions, truth)
     _kb_constant_distance(g, codes, theta)
+    _kb_dropped_block(g, codes_t, qc_t, expected_t)
+    _kb_tie_group_from_the_back(g, tie_probe)
+    _kb_blocked_merge_drops_history(g, codes, q_codes_all, X, Q)
+    _kb_mmap_that_is_a_copy(g, mmap_dir, on_disk)
+    _kb_mmap_strided(g, mm)
 
     # -- coverage --------------------------------------------------------- #
     g.coverage(
@@ -572,9 +1068,56 @@ def run_gate() -> int:
         "only past a ~256 MB code, which this does not approach)."
     )
 
+    g.coverage(
+        "The threading checks run at 4 workers on a 4-core box. Nothing here "
+        "exercises oversubscription, NUMA, or a pool shared with the caller's "
+        "own executor. The bit-identity argument is structural (disjoint row "
+        "blocks, no reduction) and does not depend on the thread count, but "
+        "the *deadlock* question — remax's pool reached from inside a caller's "
+        "pool thread — is untested."
+    )
+    g.coverage(
+        "The counting select is checked over alphabets of 257 and 2049 values "
+        "at n up to ~1e6. It says nothing about the COUNTING_MAX_VALUE edge "
+        "(65536 counters), and nothing about n large enough for the int64 "
+        "cumulative counts to matter."
+    )
+    g.coverage(
+        "The mmap checks run on a tmpfs-backed corpus of ~128 KB, which is "
+        "resident in page cache throughout. They cannot see the behaviour the "
+        "option exists for: a multi-GB index under memory pressure, where "
+        "page eviction and first-touch fault latency are the whole story. "
+        "The residency probe proves the mapping is a view; it does not prove "
+        "the mapping is a good idea at scale."
+    )
+    g.coverage(
+        "Nothing here runs two processes against one mmap'd index, which is "
+        "the sharing benefit the option is for. Single-process page-cache "
+        "coherence is what the poke-the-file probe demonstrates; cross-process "
+        "sharing is an inference from it, not a measurement."
+    )
+    g.coverage(
+        "The blocked scan is checked at n=4000 with blocks of 7 to 4001. The "
+        "cache-residency argument that motivates the default block size is a "
+        "performance claim and is neither made nor checked here — at this n "
+        "the whole corpus fits in L2 and blocking cannot help. What is checked "
+        "is only that blocking does not change the answer."
+    )
+    g.coverage(
+        "Speed is not gated, for any of these. Threading, counting select, "
+        "mmap and blocking were all motivated by cost and none of that is "
+        "checked here: there is no published constant for how fast a scan "
+        "should be, so wall-clock belongs to benchmarking discipline (matched "
+        "implementation effort, min-of-trials, a stated box) rather than to a "
+        "gate. The numbers live in bench/results/QUERY_PATH_SPEED.md, which "
+        "states its box and its scope limits."
+    )
+
     g.note(f"corpus n={N} d={D} batch m={M} k={K} seed={SEED}")
+    g.note(f"threading corpus n={N_T} B={B_T} threads={THREAD_COUNTS}")
     g.note(f"native kernel available: {remax.NATIVE_AVAILABLE}")
 
+    mm.close()
     corpus.close()
     return g.report()
 
@@ -680,6 +1223,166 @@ def _kb_constant_distance(g, codes, theta) -> None:
                f"(floor {CORR_FLOOR} -> {'fires' if corr_fires else 'accepts'})",
         covers=("collision rate is monotone in angle",
                 "packed Hamming distances equal sign-disagreement count"),
+    )
+
+
+def _kb_dropped_block(g, codes_t, qc_t, expected_t) -> None:
+    """A row split that loses the tail — the ``n // T`` per block mistake.
+
+    Validated at N_T, the size the threading path actually runs at, because at
+    a smaller size the pool is bypassed and the defect cannot occur: it would
+    have been a known-bad that is not bad at the configuration it certifies.
+    """
+    n = codes_t.shape[0]
+    worst = {}
+    for t in THREAD_COUNTS:
+        step = n // t
+        covered = step * t
+        buf = np.full(n, np.int32(-9999), dtype=np.int32)
+        # Exactly what the naive split computes: the first `covered` rows.
+        packing_mod._scan_serial(codes_t[:covered], qc_t, buf[:covered])
+        dropped = int((buf == -9999).sum())
+        wrong = int(
+            (buf[:covered].astype(np.int64) != expected_t[:covered]).sum()
+        )
+        worst[t] = (dropped, wrong)
+    # The defect only exists when T does not divide n. Asserted, not assumed:
+    # at 4*16384+137 rows, T=3 divides exactly and the naive split is correct,
+    # so this known-bad reported ACCEPTED there and turned the gate red until
+    # the corpus size was changed. A known-bad that stops being bad at some
+    # configuration certifies nothing at that configuration.
+    divides = [t for t in THREAD_COUNTS if n % t == 0]
+    rejected = not divides and all(d > 0 for d, _ in worst.values())
+    g.known_bad(
+        "a threaded split that drops the n % T tail is rejected",
+        rejected=rejected,
+        detail=f"n={n}; rows left unwritten per thread count "
+               f"{ {t: d for t, (d, _) in worst.items()} }. Thread counts "
+               f"that divide n exactly (where this is NOT a defect): "
+               f"{divides or 'none'}. The rows that WERE scanned are all "
+               f"correct ({sum(w for _, w in worst.values())} wrong), which "
+               f"is why comparing only the scanned rows would accept this",
+        covers=("every row is written by some thread",
+                "the threaded scan equals the unpackbits reference",
+                "serial scan on the threading corpus matches",
+                "the pool was actually used"),
+    )
+
+
+def _kb_tie_group_from_the_back(g, tie_probe) -> None:
+    """The cutoff's tie group taken from its end. remax#32, in a new place.
+
+    Same k distances, same order, different documents — so a check on the
+    returned *distances* accepts it and only a check on the *indices* fires.
+    """
+    correct = np.argsort(tie_probe, kind="stable")[:K]
+    all_tied = np.flatnonzero(tie_probe == tie_probe[correct[-1]])
+    broken = correct.copy()
+    broken[-1] = all_tied[-1]           # last member of the group, not first
+    same_dists = np.array_equal(tie_probe[broken], tie_probe[correct])
+    g.known_bad(
+        "a counting select that takes the tie group from its back is rejected",
+        rejected=(not np.array_equal(broken, correct)) and same_dists,
+        detail=f"broken[-1]={int(broken[-1])} vs correct {int(correct[-1])}; "
+               f"the k distances are identical ({same_dists}), so only an "
+               f"index-level check can see this — a distances-only check "
+               f"would report PASS",
+        covers=("the cutoff's tie group is taken from its FRONT",
+                "counting select equals argsort(kind='stable')",
+                "the counting and comparison paths return the identical"),
+    )
+
+
+def _kb_blocked_merge_drops_history(g, codes, q_codes_all, X, Q) -> None:
+    """A merge that keeps the newest block and forgets the running list.
+
+    Built by running the real blocked machinery with the real per-block
+    top-k and only the merge replaced, so the case exercises the blocking
+    code rather than fabricating a wrong answer.
+    """
+    blk = 333
+    n = codes.shape[0]
+    faked = []
+    for i in range(M):
+        run_i = np.empty(0, dtype=np.intp)
+        run_d = np.empty(0, dtype=np.int32)
+        for start in range(0, n, blk):
+            stop = min(start + blk, n)
+            d = np.asarray(hamming_distances(codes[start:stop], q_codes_all[i]))
+            order = packing_mod.stable_top_k(d, min(K, stop - start))
+            run_i, run_d = order + start, d[order]   # the forgetful merge
+        faked.append(run_i[:K])
+    truth = [reference_topk(X, Q[i], SEED, K) for i in range(M)]
+    differs = sum(
+        not np.array_equal(faked[i], truth[i]) for i in range(M)
+    )
+    g.known_bad(
+        "a blocked merge that forgets earlier blocks is rejected",
+        rejected=differs == M,
+        detail=f"{differs}/{M} rows differ from the float reference; the "
+               f"faked rows are still k sorted indices with real distances, "
+               f"all drawn from the last block "
+               f"([{int(faked[0].min())}, {int(faked[0].max())}] of "
+               f"[0, {n})) ",
+        covers=("the blocked scan's top-k matches the float reference",
+                "blocked and unblocked agree bit-for-bit"),
+    )
+
+
+def _kb_mmap_that_is_a_copy(g, mmap_dir, on_disk) -> None:
+    """An "mmap" that read the file. Every query answer is correct.
+
+    This is the case that motivates the poke-the-file probe: the codes match
+    the file byte for byte, the neighbours match the anchor, the record_ids
+    match the database. Nothing about the *results* is wrong. Only the claim
+    is.
+    """
+    path = mmap_dir / corpus_mod._BIN_NAME
+    real = corpus_mod._open_codes
+    copied, n, d, _seed = real(path, "mmap")
+    copied = np.array(copied)                     # the defect, in one call
+    probe_off = corpus_mod._HEADER_LEN + (N // 2) * (D // 8)
+    old = int(copied[N // 2, 0])
+    poke_file(path, probe_off, old ^ 0xFF)
+    sees_write = int(copied[N // 2, 0]) == (old ^ 0xFF)
+    poke_file(path, probe_off, old)
+    matches_disk = np.array_equal(copied, on_disk)
+    g.known_bad(
+        "an 'mmap' that is really a copy is rejected",
+        rejected=(not sees_write) and matches_disk,
+        detail=f"the copy matches the file's bytes ({matches_disk}) and would "
+               f"answer every query identically; it does not see a later "
+               f"write to the file ({sees_write}), which is the only "
+               f"observable difference and therefore the only thing that can "
+               f"catch it",
+        covers=("the mmap corpus is a view of the file",),
+    )
+
+
+def _kb_mmap_strided(g, mm) -> None:
+    """A memmap window that is not C-contiguous — a per-query whole-index copy.
+
+    Free at open time, so the residency benchmark still reports a win while
+    every query pays 32 MB of memcpy.
+    """
+    strided = np.repeat(np.asarray(mm.codes), 2, axis=0)[::2]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        packing_mod.as_codes(strided)
+    warned = any(
+        issubclass(w.category, NonContiguousCodesWarning) for w in caught
+    )
+    g.known_bad(
+        "a non-contiguous mmap window is rejected",
+        rejected=warned and not strided.flags["C_CONTIGUOUS"],
+        detail=f"strided view: C_CONTIGUOUS={strided.flags['C_CONTIGUOUS']}, "
+               f"as_codes warned={warned} "
+               f"({strided.nbytes / 1e6:.1f} MB copied per query); the values "
+               f"are identical to the real codes "
+               f"({np.array_equal(strided, np.asarray(mm.codes))}), so only "
+               f"the contiguity check sees it",
+        covers=("the memmap window is C-contiguous",
+                "searching an mmap corpus copies nothing"),
     )
 
 

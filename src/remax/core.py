@@ -33,11 +33,18 @@ import numpy as np
 from .packing import (
     as_codes,
     asymmetric_scores,
+    asymmetric_tables,
     encode_signs,
     hamming_distances,
+    hamming_topk_batch,
+    scores_from_table,
     stable_top_k,
 )
 from .rotation import ROTATIONS, build_rotation, haar_rotation, rht_rotation
+
+#: Byte budget for the batched asymmetric table block. 64 MB holds m=256
+#: queries at d=2048; larger batches are processed in groups of that size.
+_ASYM_TABLE_BUDGET = 64 << 20
 
 __all__ = [
     "SignBitQuantizer",
@@ -178,6 +185,8 @@ class SignBitQuantizer:
         k: int = 10,
         *,
         return_distances: bool = False,
+        threads: int | str | None = None,
+        block: int | None = None,
     ):
         """Top-k Hamming search of ``query`` against an encoded corpus.
 
@@ -192,6 +201,18 @@ class SignBitQuantizer:
             Number of neighbours per query.
         return_distances : bool, keyword-only
             If True, also return Hamming distances.
+        threads : int | "auto" | None, keyword-only
+            Threads for the scan. ``None`` uses the process-wide default
+            (:func:`remax.packing.get_default_threads`, 1 unless changed), so
+            the default behaviour is unchanged. The ctypes kernel releases the
+            GIL, so this is real parallelism; results are bit-identical at any
+            thread count because the decomposition is a row partition.
+        block : int | None, keyword-only
+            Corpus rows held per pass. ``None`` blocks automatically for a
+            batch (``m >= 2``) so the corpus is read once per block for all
+            queries instead of once per query, and does not block a single
+            query. ``block=len(codes)`` forces the old per-query full pass.
+            Output is bit-identical either way.
 
         Returns
         -------
@@ -233,27 +254,17 @@ class SignBitQuantizer:
 
         rotated = query @ self.rotation_
         q_codes = encode_signs(rotated)  # (m, d//8)
-        m = q_codes.shape[0]
         n = codes.shape[0]
         k_eff = min(k, n)
 
-        out_idx = np.empty((m, k_eff), dtype=np.intp)
-        out_dist = np.empty((m, k_eff), dtype=np.int64)
-
-        # Per-query loop — fine for v0.1.0 (O(m·n·B) work either way, and
-        # the SIMD popcount kernel that would justify full vectorisation
-        # is explicitly post-v0.1.0).
-        #
-        # One (n,) int32 scratch buffer for the whole batch instead of one per
-        # query: at n=1M that is 4 MB allocated and freed per query. The
-        # kernel writes every element on every call, so query i cannot read
-        # anything left behind by query i-1.
-        dists = np.empty(n, dtype=np.int32)
-        for i in range(m):
-            hamming_distances(codes, q_codes[i], out=dists)
-            order = stable_top_k(dists, k_eff)
-            out_idx[i] = order
-            out_dist[i] = dists[order]
+        # The m-loop, the row blocking and the scan threading all live in
+        # packing.hamming_topk_batch — one implementation, one place for the
+        # blocked/unblocked equivalence to be checked. int64 distances are the
+        # documented public dtype; the kernel works in int32.
+        out_idx, out_dist32 = hamming_topk_batch(
+            codes, q_codes, k_eff, threads=threads, block=block
+        )
+        out_dist = out_dist32.astype(np.int64)
 
         if squeezed:
             out_idx = out_idx[0]
@@ -333,15 +344,33 @@ class SignBitQuantizer:
 
         rotated = query @ self.rotation_
         n = codes.shape[0]
+        n_bytes = codes.shape[1]
+        m = query.shape[0]
         k_eff = min(k, n)
-        out_idx = np.empty((query.shape[0], k_eff), dtype=np.intp)
-        out_sc = np.empty((query.shape[0], k_eff), dtype=np.float32)
+        out_idx = np.empty((m, k_eff), dtype=np.intp)
+        out_sc = np.empty((m, k_eff), dtype=np.float32)
 
-        for i in range(query.shape[0]):
-            scores = asymmetric_scores(rotated[i], codes)
-            order = stable_top_k(-scores, k_eff)
-            out_idx[i] = order
-            out_sc[i] = scores[order]
+        # Build every query's (B, 256) byte table before the loop, in one
+        # batched GEMM, instead of one small GEMM per iteration. The tables
+        # depend only on the queries, so rebuilding them inside the loop was
+        # pure repetition: 136 us per query at d=2048 on the box in
+        # bench/results/QUERY_PATH_SPEED.md. Bit-identical — the arithmetic is
+        # the same contraction, just batched (tests/test_asymmetric.py).
+        #
+        # Queries are grouped so the table block stays bounded: m * B * 256 * 4
+        # bytes would be 200 MB for m=1000 at d=2048.
+        group = max(1, _ASYM_TABLE_BUDGET // max(1, n_bytes * 256 * 4))
+        scratch = np.empty(n, dtype=np.float32)
+        for lo in range(0, m, group):
+            hi = min(lo + group, m)
+            tables, offsets = asymmetric_tables(rotated[lo:hi], n_bytes)
+            for j in range(hi - lo):
+                scores = scores_from_table(
+                    tables[j], codes, float(offsets[j]), out=scratch
+                )
+                order = stable_top_k(-scores, k_eff)
+                out_idx[lo + j] = order
+                out_sc[lo + j] = scores[order]
 
         if squeezed:
             out_idx = out_idx[0]

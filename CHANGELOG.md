@@ -2,6 +2,90 @@
 
 ## Unreleased
 
+Two independent lines of work: query-path throughput, and a consolidation pass
+that removed about a fifth of the Python in the repository.
+
+Everything in the throughput half is **bit-identical** to what it replaces —
+the scan stays exhaustive, there is still no cell assignment, no multi-probe
+and no candidate pruning, so recall is unchanged by construction rather than
+by tolerance. `bench/gates/query_path_gate.py` is what holds that, and it now
+proves itself against 14 simulated defects rather than 8.
+
+The consolidation half **removes two exported functions**; see
+*Removed — breaking* below.
+
+## Unreleased — query path
+
+### Added
+
+- **Threaded scan.** `hamming_distances(..., threads=)`, `search(..., threads=)`,
+  `packing.set_default_threads()`, and the `REMAX_THREADS` environment
+  variable. The C kernel is called through `ctypes`, which releases the GIL, so
+  the scan parallelises with no change to the C at all. Row blocks partition
+  the corpus and each thread writes a disjoint slice of one output buffer, so
+  the answer cannot depend on the thread count.
+
+  Off by default. A library that silently spawns threads inside somebody
+  else's worker pool is a bad neighbour, and — measured — threading a small
+  corpus is *slower* than not threading it, so there is also no free lunch to
+  hand out by default.
+- **Counting select.** `packing.counting_top_k`, dispatched automatically from
+  `stable_top_k` for integer distances above a measured size threshold.
+  Hamming distances are integers in `[0, 8B]`, so selection needs a histogram
+  rather than a comparison partition; this replaces `argpartition`'s `8n`-byte
+  permutation (80 MB at n=1e7) with ~2 KB of counters. Same byte-for-byte
+  contract as before — `np.argsort(kind="stable")[:k]`, the contract PR #32
+  exists to defend. The float caller in `search_asymmetric` keeps the
+  comparison path, where a histogram is not defined.
+- **`Corpus(path, residency="mmap")`.** Maps `index.bin` read-only instead of
+  reading it into private heap: O(1) open, pages faulted on touch, shared
+  between processes, evictable under pressure. Default is `"load"`, unchanged.
+  The memmap window is asserted C-contiguous at open — losing that would turn
+  the contiguity guard added in #63 into a whole-index copy on every query
+  while the open-time number still looked like a win.
+- **`Corpus.search(..., asymmetric=True)`.** The measured +0.019 nDCG@10 at
+  128 B/vector (+0.084 at 16 B, LFM2.5/SciFact) was previously unreachable
+  through `Corpus`, which is the only supported index API — it hardcoded the
+  symmetric path. Off by default because it is substantially slower.
+- **`bench/query_path_speed.py`** and `bench/results/QUERY_PATH_SPEED.md` — a
+  benchmark, explicitly not a gate, stating its box, its min-of-trials rule,
+  what makes each pair of arms comparable, and which corpus sizes were
+  actually run.
+
+### Changed
+
+- **The m-query loop is blocked.** `SignBitQuantizer.search` and the new
+  `packing.hamming_topk_batch` read a cache-sized block of the corpus once and
+  score it against all m queries, instead of reading the whole corpus once per
+  query. Exact across blocks: each block contributes its own stable top-k,
+  merged by a stable sort on distance, which reproduces `(distance, index)`
+  order because blocks are visited in increasing row order. `block=len(codes)`
+  restores the old loop; the output is identical either way.
+- **`search_asymmetric` builds all m byte tables in one batched GEMM** before
+  its loop rather than one small GEMM per iteration. Bit-identical.
+
+### Notes
+
+Three things found by the gate and the benchmark rather than by review, all
+recorded where they happened:
+
+- The first thread-count cutoff was **16384 rows**, which at B=32 is 512 KB —
+  well inside the region where threading measures 0.5–0.8x, i.e. a slowdown.
+  The correctness gate is structurally unable to see this: the answers were
+  right the whole time. The cutoff is now 2 MB of code *per thread*, derived
+  from the measured dispatch cost (~60 µs) against the ~9.7 GB/s single-core
+  scan rate.
+- The dropped-tail known-bad reported **ACCEPTED** twice, at thread counts
+  that happened to divide the corpus size exactly — where the naive `n // T`
+  split is genuinely correct and the "known-bad" is not bad at all. The gate's
+  corpus size is now searched for rather than typed.
+- Batched and single-query `search_asymmetric` scores already differed in the
+  last ulp on v0.1.0, because `query @ rotation_` selects a different BLAS
+  kernel at m=1 than at m=8. Pre-existing, unrelated to the table hoist, and
+  worth knowing before someone else spends an afternoon on it.
+
+## Unreleased — consolidation
+
 ### Removed — breaking
 
 - **`remax.hamming_search` and `remax.asymmetric_search` are gone.** Both were
@@ -65,7 +149,6 @@ Total: Python in the repository goes from 22,635 to 17,756 lines (−21.6%).
   `-mpopcnt` at import, and `corpus.py` specifies a `RMAX` magic-byte format.
   The list is now a table of overrides with the justification each one met, so
   the document describes the project that exists.
-
 ## v0.1.0 — 2026-08-03
 
 First tagged release. The library has been importable and useful for a while;

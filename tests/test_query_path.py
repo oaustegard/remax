@@ -3,7 +3,7 @@
 The deep version of these properties lives in
 ``bench/gates/query_path_gate.py``, which anchors on a float sign-disagreement
 reference and the Charikar collision identity, and proves itself by going red
-under eight simulated defects. These are the fast unit-level equivalents, so
+under fourteen simulated defects. These are the fast unit-level equivalents, so
 the contract is pinned by ``pytest`` too and a regression shows up on every
 push rather than only in the gate job.
 """

@@ -82,6 +82,8 @@ bench/results/*
 !bench/results/lfm25_finetune_feasibility.json
 !bench/results/lfm25_finetune_retrieval.json
 !bench/results/lfm25_finetune_retrieval_1epoch.json
+!bench/results/QUERY_PATH_SPEED.md
+!bench/results/query_path_speed.json
 
 # ── IDE ──────────────────────────────────────────────────────────────────────
 .vscode/

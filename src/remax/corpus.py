@@ -232,6 +232,100 @@ def _write_rotation(path: Path, kind: str) -> None:
         pass
 
 
+#: Accepted values for ``Corpus(residency=...)``.
+RESIDENCY = ("load", "mmap")
+
+#: What ``residency`` defaults to. ``"load"`` is the historical behaviour —
+#: ``np.fromfile`` the whole index into private anonymous heap — and it stays
+#: the default so opening an existing corpus is byte-for-byte the same
+#: operation it was. ``"mmap"`` is opt-in.
+_DEFAULT_RESIDENCY = "load"
+
+
+def _open_codes(
+    bin_path: Path, residency: str
+) -> tuple[np.ndarray, int, int, int | None]:
+    """Return ``(codes, n, d, seed)`` for an index file.
+
+    ``residency="load"``
+        ``np.fromfile`` — the whole index becomes private resident heap.
+        1.6 s and 3.2 GB of RSS for a 3.2 GB index, paid before the first
+        query, and paid again in every process that opens it.
+    ``residency="mmap"``
+        ``np.memmap(mode="r")`` — the kernel maps the file's page cache into
+        the address space. Open is O(1); pages arrive on first touch and are
+        shared between processes and evictable under pressure.
+
+    **The memmap must stay C-contiguous.** ``as_codes`` (see
+    :mod:`remax.packing`) copies a non-contiguous code matrix — once per
+    query, whole index — so an mmap path that lost contiguity would trade a
+    one-off load for a permanent per-query copy and look like a win in the
+    open-time number. ``np.memmap`` page-aligns the mapping internally and
+    exposes the requested window as a plain offset into it, so a 1-D window
+    reshaped to ``(n, B)`` is contiguous; this function asserts that rather
+    than assuming it, and ``tests/test_corpus.py`` asserts it again from
+    outside.
+    """
+    if residency not in RESIDENCY:
+        raise ValueError(
+            f"unknown residency {residency!r}; expected one of {list(RESIDENCY)}"
+        )
+
+    bin_size = bin_path.stat().st_size
+    # Bound the file size before reading: refuse hostile/runaway files.
+    if bin_size > (1 << 40):  # 1 TiB
+        raise ValueError(
+            f"index.bin is {bin_size} bytes (>1 TiB); refusing to load"
+        )
+
+    with open(bin_path, "rb") as f:
+        head = np.frombuffer(f.read(_HEADER_LEN), dtype=np.uint8)
+    n, d, seed, payload_off = _read_header(head)
+
+    codes_bytes = n * (d // 8)
+    expected = payload_off + codes_bytes
+    if bin_size < expected:
+        raise ValueError(
+            f"corrupt index: header claims {n}x{d // 8} bytes of codes "
+            f"({codes_bytes} bytes payload) but file has only "
+            f"{bin_size - payload_off} payload bytes"
+        )
+    if bin_size > expected:
+        warnings.warn(
+            f"index.bin has {bin_size - expected} trailing bytes after "
+            f"payload; ignoring",
+            UserWarning,
+            stacklevel=4,
+        )
+
+    if codes_bytes == 0:
+        # mmap of length 0 is an error on every platform; an empty corpus is
+        # not, so it short-circuits to an empty array either way.
+        return np.empty((n, d // 8), dtype=np.uint8), n, d, seed
+
+    if residency == "load":
+        raw = np.fromfile(bin_path, dtype=np.uint8)
+        codes = raw[payload_off : payload_off + codes_bytes].reshape(n, d // 8)
+    else:
+        flat = np.memmap(
+            bin_path,
+            dtype=np.uint8,
+            mode="r",
+            offset=payload_off,
+            shape=(codes_bytes,),
+        )
+        codes = flat.reshape(n, d // 8)
+
+    if not codes.flags["C_CONTIGUOUS"]:  # pragma: no cover - defensive
+        raise RuntimeError(
+            f"remax internal error: {residency} codes are not C-contiguous. "
+            "Scanning them would copy the whole index on every query (see "
+            "remax.packing.as_codes); refusing to open rather than ship that "
+            "silently."
+        )
+    return codes, n, d, seed
+
+
 def _meta_rows(
     ids: list[str], meta: list[dict] | None
 ) -> Iterator[tuple[int, str, str | None]]:
@@ -253,6 +347,7 @@ class Corpus:
         path: str | Path,
         *,
         dtype: np.dtype | type | None = None,
+        residency: str = _DEFAULT_RESIDENCY,
     ):
         """Open an existing corpus directory.
 
@@ -267,6 +362,33 @@ class Corpus:
             match queries against corpora that were built before the
             f32-default change if you want bit-exact query encoding;
             recall is statistically identical either way.
+        residency : {"load", "mmap"}, default "load"
+            How ``index.bin`` reaches memory.
+
+            ``"load"`` reads it with ``np.fromfile``: the whole index becomes
+            private resident heap before the constructor returns. This is the
+            historical behaviour and stays the default.
+
+            ``"mmap"`` maps it read-only with :class:`numpy.memmap`. Opening
+            is O(1) instead of O(file); pages are faulted in on first touch,
+            shared across processes that open the same index, and evictable
+            under memory pressure instead of pinned. Costs a page fault on
+            first touch of each page and leaves the scan at the mercy of the
+            page cache, so a cold first query is slower than a warm one — the
+            trade is open-time and footprint against first-touch latency.
+
+            Distances, neighbours and metadata are identical under both: the
+            bytes are the same bytes.
+
+            One caveat on :meth:`close`. It closes the SQLite connections, as
+            it always has, but it does **not** unmap the index — dropping the
+            mapping out from under an array a caller may still hold a
+            reference to (``corpus.codes``) would turn a use-after-close into
+            a segfault rather than an exception, which is a much worse
+            failure than the one it would fix. The mapping is released when
+            the ``Corpus`` and any arrays derived from it are collected. On
+            Windows that means an open mapping can delay removing the corpus
+            directory; drop your references first if that matters.
 
         Notes
         -----
@@ -284,35 +406,8 @@ class Corpus:
         if not db_path.exists():
             raise FileNotFoundError(f"meta.db not found in {self._dir}")
 
-        # Bound the file size before reading: refuse hostile/runaway files.
-        bin_size = bin_path.stat().st_size
-        if bin_size > (1 << 40):  # 1 TiB
-            raise ValueError(
-                f"index.bin is {bin_size} bytes (>1 TiB); refusing to load"
-            )
-
-        raw = np.fromfile(bin_path, dtype=np.uint8)
-        n, d, seed, payload_off = _read_header(raw)
-
-        # Verify file is exactly the size the header claims.
-        codes_bytes = n * (d // 8)
-        expected = payload_off + codes_bytes
-        if raw.size < expected:
-            raise ValueError(
-                f"corrupt index: header claims {n}x{d // 8} bytes of codes "
-                f"({codes_bytes} bytes payload) but file has only "
-                f"{raw.size - payload_off} payload bytes"
-            )
-        if raw.size > expected:
-            warnings.warn(
-                f"index.bin has {raw.size - expected} trailing bytes after "
-                f"payload; ignoring",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        codes_flat = raw[payload_off : payload_off + codes_bytes]
-        self._codes = codes_flat.reshape(n, d // 8)
+        self._residency = residency
+        self._codes, n, d, seed = _open_codes(bin_path, residency)
         # Always passed explicitly: the stored corpus decides, not the
         # quantizer's current default.
         self._rotation = _read_rotation(self._dir)
@@ -470,7 +565,15 @@ class Corpus:
     # Public API
     # ------------------------------------------------------------------ #
 
-    def search(self, query: np.ndarray, k: int = 10):
+    def search(
+        self,
+        query: np.ndarray,
+        k: int = 10,
+        *,
+        asymmetric: bool = False,
+        threads: int | str | None = None,
+        block: int | None = None,
+    ):
         """Return the top-k nearest neighbours with resolved metadata.
 
         Parameters
@@ -479,6 +582,34 @@ class Corpus:
             A single query, or a batch of them.
         k : int
             Neighbours per query.
+        asymmetric : bool, keyword-only, default False
+            Score with the float query against the stored sign bits
+            (:meth:`SignBitQuantizer.search_asymmetric`) instead of binarizing
+            the query too. Same index, same bytes on disk — the only change is
+            that the query keeps its precision, which costs nothing because a
+            query occupies no index storage.
+
+            Worth **+0.019 nDCG@10 at 128 B/vector**, widening to +0.084 at
+            16 B, on LFM2.5/SciFact (``bench/results/lfm25_asymmetric.json``).
+            Until this argument existed that measured gain was unreachable
+            through ``Corpus``, which is the only supported index API: the
+            symmetric path was hardcoded.
+
+            Default False, because it is **substantially slower** — the
+            gather-and-sum cannot use the popcount kernel. Measure on your own
+            shape before turning it on; see ``bench/results/QUERY_PATH_SPEED.md``.
+
+            ``Result.distance`` stays an int and stays "smaller is better": for
+            the asymmetric path it carries the score rounded toward zero, so
+            the field is not silently reinterpreted. Read the ordering, not the
+            magnitude.
+        threads : int | "auto" | None, keyword-only
+            Threads for the Hamming scan. ``None`` keeps the process-wide
+            default (1 unless :func:`remax.packing.set_default_threads` or
+            ``REMAX_THREADS`` says otherwise). Ignored when ``asymmetric``.
+        block : int | None, keyword-only
+            Corpus rows per pass; see :meth:`SignBitQuantizer.search`. Ignored
+            when ``asymmetric``.
 
         Returns
         -------
@@ -516,9 +647,15 @@ class Corpus:
         if self._mean is not None:
             query = query - self._mean
 
-        indices, distances = self._quantizer.search(
-            query, self._codes, k=k, return_distances=True
-        )
+        if asymmetric:
+            indices, distances = self._quantizer.search_asymmetric(
+                query, self._codes, k=k, return_scores=True
+            )
+        else:
+            indices, distances = self._quantizer.search(
+                query, self._codes, k=k, return_distances=True,
+                threads=threads, block=block,
+            )
         indices = np.atleast_2d(np.asarray(indices))
         distances = np.atleast_2d(np.asarray(distances))
 
@@ -668,6 +805,11 @@ class Corpus:
         return self._mean is not None
 
     @property
+    def residency(self) -> str:
+        """How ``index.bin`` reached memory: ``"load"`` or ``"mmap"``."""
+        return self._residency
+
+    @property
     def rotation(self) -> str:
         """Rotation construction these codes were encoded with.
 
@@ -685,4 +827,12 @@ class Corpus:
             if self._rotation == _LEGACY_ROTATION
             else f", rotation={self._rotation!r}"
         )
-        return f"Corpus(n={self.n}, d={self.d}{c}{r}, path={str(self._dir)!r})"
+        res = (
+            ""
+            if self._residency == _DEFAULT_RESIDENCY
+            else f", residency={self._residency!r}"
+        )
+        return (
+            f"Corpus(n={self.n}, d={self.d}{c}{r}{res}, "
+            f"path={str(self._dir)!r})"
+        )
