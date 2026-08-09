@@ -4,22 +4,60 @@
 
 ### Added
 
-- **`docs/athena-recipe.md`** — running the Hamming scan as SQL over Parquet
-  on S3, for a corpus that already lives there. No library change and no new
-  dependency: `pyarrow` is invoked only from the recipe's own snippets.
+- **S3 Vectors recipe** (`docs/s3-vectors-recipe.md`). The managed-ANN path:
+  S3 Vectors stores `float32` only and scores `cosine`/`euclidean`, so remax's
+  binary codes have no place in it and remax's contribution narrows to the
+  dimensional transform, the record-ID mapping, and the stage-2 source.
+  Documentation only — no library code changed, and nothing imports `boto3`.
 
-  The schema is not the obvious one. Trino's `bit_count` and `bitwise_xor`
-  take `bigint` and nothing else — there is no varbinary popcount — so a
-  `BINARY(32)` code column has no query to run against it. Codes are stored
-  as `d / 64` big-endian `BIGINT` limbs instead and scored with a sum of
-  per-limb popcounts.
+- **`bench/s3_vectors_transform.py`** plus
+  `bench/results/S3_VECTORS_TRANSFORM.md`. Measures which transform belongs in
+  such an index, because the existing figure could not be carried over:
+  `bench/results/SKETCH_MATRYOSHKA.md`'s center+truncate R@100 = 0.943 at 256-d was measured
+  with an **inner-product** scan, and no managed service offers raw IP. Two
+  results, 8 seeds each, on a driver that reproduces that file's rows exactly
+  at its own seed:
 
-  `tests/test_athena_recipe.py` extracts the recipe's `to_limbs` and
-  `hamming_sql`, evaluates the SQL they generate under Trino's semantics, and
-  asserts the ranking matches `Corpus.search`. A drifting transform would
-  otherwise return a well-formed ranking of the wrong neighbours rather than
-  an error. The SQL has not been run against a live Athena endpoint; the
-  recipe says so in its closing section.
+  - Scoring cosine instead of IP over the same 256-d bytes moves truncate-only
+    from R@100 = 0.887 to **0.998**. SPECTER2 norms are clustered tightly
+    enough (cv 0.0067) that discarding them costs almost nothing.
+  - **Centering is a net loss on this path** — truncate-only wins by +0.042
+    R@10 at 256-d on 8 of 8 seeds, widening to +0.094 against cosine ground
+    truth. This is the boundary of the centering result, not a contradiction
+    of it: centering fixes thresholding at the origin, and a float32 cosine
+    index does not threshold. `Corpus.build(center=True)` remains correct and
+    load-bearing for the binary path.
+
+- **Athena + Parquet recipe** (`docs/athena-recipe.md`). The binary-scan path:
+  the same exhaustive Hamming scan, run as SQL over Parquet on S3 for a corpus
+  that already lives there. Documentation only — no library code changed, and
+  `pyarrow` is invoked from the recipe's snippets rather than the library.
+
+  Its schema is not the obvious one. Trino's `bit_count` and `bitwise_xor` take
+  `bigint` and nothing else — there is no varbinary popcount, and Athena engine
+  v3 is Trino-based — so a `BINARY(32)` code column has no query to run against
+  it. Codes are stored as `ceil(d / 64)` big-endian `BIGINT` limbs instead and
+  scored as a sum of per-limb popcounts.
+
+  This and the S3 Vectors recipe above are the two ways to serve a corpus out
+  of S3, and they are not variants of each other: S3 Vectors is float32-only,
+  so the binary codes have no place in it, whereas Athena scans exactly the
+  bytes `Corpus` writes. Athena reads the whole index every query and bills for
+  it (~3.7 GB, about $0.018 at 100 M × 256-d), so the recipe leads with the
+  case where that is the right trade and where it is not.
+
+- **`tests/test_athena_recipe.py`.** Extracts `to_limbs` and `hamming_sql` from
+  the recipe, evaluates the SQL they generate under Trino's
+  `bit_count`/`bitwise_xor` semantics, and asserts the ranking is identical to
+  `Corpus.search`. The recipe asks a reader to reimplement the scan in a second
+  place, and a drifting byte-to-limb transform does not raise — it returns a
+  well-formed ranking of the wrong neighbours. Shown to bite by mutating the
+  document: reversing the limb order in the generated SQL fails the ranking
+  test, byte-swapping the transform fails the round-trip test.
+
+  Not covered, because it is not coverable from here: that Athena accepts the
+  SQL. The signatures come from the Trino function reference; nothing has run
+  against a live endpoint, and the recipe's closing section says so.
 
 ## v0.2.0 — 2026-08-04
 

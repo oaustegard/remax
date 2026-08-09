@@ -7,8 +7,15 @@ standing up a server to hold it.
 
 This is a **recipe**, not a runtime dependency. Nothing in `remax` imports
 `pyarrow`, `boto3`, or anything AWS; every snippet below runs in your code,
-not the library's. Its companion is
-[`postgres-recipe.md`](postgres-recipe.md), which does the same for metadata.
+not the library's.
+
+It is one of two ways to serve a corpus out of S3, and they are not variants
+of each other. [`s3-vectors-recipe.md`](s3-vectors-recipe.md) hands the index
+to AWS, which means float32 at 1 KB/vector and no binary codes at all — remax's
+role there narrows to the transform. This path keeps the codes: Athena scans
+exactly the 32 bytes per vector that `Corpus` writes, with the same Hamming
+distance, and remax's product survives intact. [`postgres-recipe.md`](postgres-recipe.md)
+is orthogonal to both — it moves the metadata, not the scan.
 
 What you are buying, stated plainly up front: Athena reads the entire index
 on every query, because an exhaustive Hamming scan has no predicate to prune
@@ -355,9 +362,13 @@ top10 = [candidates[i] for i in np.argsort(-scores)[:10]]
 all. Point lookups are the whole workload here, which is exactly what object
 storage is good at and what a scan engine is not.
 
-**[S3 Vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html)**
-if you want the vectors queryable in their own right rather than only
-addressable by position.
+**[S3 Vectors](s3-vectors-recipe.md)** if you want the vectors queryable
+in their own right rather than only addressable by position. That recipe
+measures which transform to push into a cosine-metric index, and its answer is
+not this document's: centering is a net loss there (8 of 8 seeds), because a
+float32 cosine index never thresholds at the origin. Keep the two encodings
+separate — the vectors you send to S3 Vectors are not the vectors these codes
+were built from.
 
 **Postgres**, if metadata already lives there — see
 [`postgres-recipe.md`](postgres-recipe.md), whose `pos` column is the same
