@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Added
+
+- **S3 Vectors recipe** (`docs/s3-vectors-recipe.md`). The managed-ANN path:
+  S3 Vectors stores `float32` only and scores `cosine`/`euclidean`, so remax's
+  binary codes have no place in it and remax's contribution narrows to the
+  dimensional transform, the record-ID mapping, and the stage-2 source.
+  Documentation only — no library code changed, and nothing imports `boto3`.
+
+- **`bench/s3_vectors_transform.py`** plus
+  `bench/results/S3_VECTORS_TRANSFORM.md`. Measures which transform belongs in
+  such an index, because the existing figure could not be carried over:
+  `bench/results/SKETCH_MATRYOSHKA.md`'s center+truncate R@100 = 0.943 at 256-d was measured
+  with an **inner-product** scan, and no managed service offers raw IP. Two
+  results, 8 seeds each, on a driver that reproduces that file's rows exactly
+  at its own seed:
+
+  - Scoring cosine instead of IP over the same 256-d bytes moves truncate-only
+    from R@100 = 0.887 to **0.998**. SPECTER2 norms are clustered tightly
+    enough (cv 0.0067) that discarding them costs almost nothing.
+  - **Centering is a net loss on this path** — truncate-only wins by +0.042
+    R@10 at 256-d on 8 of 8 seeds, widening to +0.094 against cosine ground
+    truth. This is the boundary of the centering result, not a contradiction
+    of it: centering fixes thresholding at the origin, and a float32 cosine
+    index does not threshold. `Corpus.build(center=True)` remains correct and
+    load-bearing for the binary path.
+
+- **`bench/scale100m.py` and `bench/results/SCALE_100M.md`** — the n=1e6..1e8
+  single-query measurement. `bench/results/QUERY_PATH_SPEED.md` establishes
+  nothing above n=1e7 and says so; this is the range it declined to
+  extrapolate into.
+
+- **Two more simulated defects in `bench/gates/query_path_gate.py`**
+  (16 total, was 14), both aimed at the new filter below: a threshold read off
+  the front of the candidate list rather than from its k-th slot, and a
+  per-block trim that cuts with `argpartition` instead of a stable sort. Plus a
+  blocked check on a corpus built so blocks overflow the k-list into a tie
+  group — a far prefix that keeps the threshold loose, then five distinct near
+  rows repeated 800 times — which is what makes the trim run at all, and which
+  turned out to be needed to keep an *existing* known-bad
+  (`blocked-merge-forgets-earlier-blocks`) red, since the new filter had made
+  that defect's guard inert. The check asserts that the trim actually ran with
+  a boundary tie, so it cannot go quietly vacuous the way its first draft did.
+
 ### Changed
 
 - **The single-query path is now blocked, and every block filters against a
@@ -26,29 +69,13 @@
   Selection was the whole cost at scale, not the scan: at n=1e8 it was 0.81x
   the scan and is now 0.095x. Numbers, arms and scope in
   `bench/results/SCALE_100M.md`, reproduced by `bench/scale100m.py`.
+
 - **`hamming_topk_batch` honours `threads=` for a single query.** In the
   blocked path the parallel unit is one (block, query) scan, which needs
   `m > 1`; a single query fell through that and ran its inner scans pinned to
   one thread. Reachable before this release only by passing `block=`
   explicitly, and load-bearing now that a single query blocks by default —
   without it a four-thread caller would have been silently serialised.
-
-### Added
-
-- **`bench/scale100m.py` and `bench/results/SCALE_100M.md`** — the n=1e6..1e8
-  single-query measurement. `bench/results/QUERY_PATH_SPEED.md` establishes nothing above
-  n=1e7 and says so; this is the range it declined to extrapolate into.
-- **Two more simulated defects in `bench/gates/query_path_gate.py`**
-  (16 total, was 14), both aimed at the new filter: a threshold read off the
-  front of the candidate list rather than from its k-th slot, and a per-block
-  trim that cuts with `argpartition` instead of a stable sort. Plus a blocked
-  check on a corpus built so blocks overflow the k-list into a tie group — a
-  far prefix that keeps the threshold loose, then five distinct near rows
-  repeated 800 times — which is what makes the trim run at all, and which
-  turned out to be needed to keep an *existing* known-bad
-  (`blocked-merge-forgets-earlier-blocks`) red, since the new filter had made
-  that defect's guard inert. The check asserts that the trim actually ran with
-  a boundary tie, so it cannot go quietly vacuous the way its first draft did.
 
 ## v0.2.0 — 2026-08-04
 

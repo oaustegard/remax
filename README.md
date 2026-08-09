@@ -36,6 +36,12 @@ Future work is tracked in [issues](https://github.com/oaustegard/remax/issues). 
 - [`RERANK.md`](bench/results/RERANK.md) — two-stage pipeline: sign-bit stage 1 → float32-IP rerank recovers to R@10 = 0.983 at 0.1 ms/query. Cross-encoder rerank (ms-marco-MiniLM-L-6-v2, ONNX Runtime) tested and characterized.
 - [`ROTATION_LSH.md`](bench/results/ROTATION_LSH.md) — does the Charikar collision guarantee survive a structured rotation? Collision rate vs `θ/π`, estimator spread, cross-stack independence, then end-to-end recall. Also documents two optimizations measured and rejected.
 - [`SKETCH_MATRYOSHKA.md`](bench/results/SKETCH_MATRYOSHKA.md) / [`SKETCH_MATRYOSHKA_GEMINI.md`](bench/results/SKETCH_MATRYOSHKA_GEMINI.md) — post-hoc Matryoshka via random-dimension sketching on SPECTER2 and Gemini embeddings.
+- [`S3_VECTORS_TRANSFORM.md`](bench/results/S3_VECTORS_TRANSFORM.md) — which transform to push to a cosine-metric managed ANN index. Centering is a net loss there (8/8 seeds) despite being the biggest lever on the binary path, and the metric switch from IP to cosine is worth more than any transform choice.
+
+**Recipes** (`docs/`):
+- [Text-to-candidates pipeline](docs/specter2-search-pipeline.md) — end-to-end SPECTER2 search on the binary path: encode, build, search, rerank.
+- [S3 Vectors recipe](docs/s3-vectors-recipe.md) — the managed-ANN path. S3 Vectors is float32-only, so remax's role narrows to the transform and the ID mapping; 256-d truncated + cosine returns R@100 = 0.998.
+- [Postgres recipe](docs/postgres-recipe.md) — serve `Corpus` metadata from Postgres instead of the SQLite sidecar.
 
 **Test suite**: full coverage across core, stacked, corpus, native, characterize, and all benchmark modules. Security hardening pass completed.
 
@@ -117,8 +123,8 @@ batch_top_k = q.search(embeddings[:8], codes, k=10)
 # held, their k-th distance bounds everything that could still matter, so each
 # block is filtered against it while still in cache instead of every distance
 # being written out and ranked in full. Selection, not the scan, is what costs
-# at scale: at n=1e8 it was 0.96x the scan and is now 0.18x. Automatic above a
-# measured n; see bench/results/SCALE_100M.md.
+# at scale: at n=1e8 it was 0.81x the scan and is now 0.095x. Automatic above
+# a measured n; see bench/results/SCALE_100M.md.
 one_query = q.search(query, codes, k=10)
 
 # mmap an index instead of reading it into private heap: O(1) open, pages
