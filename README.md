@@ -25,7 +25,7 @@ Future work is tracked in [issues](https://github.com/oaustegard/remax/issues). 
 **Core library** (`src/remax/`):
 - `SignBitQuantizer` — 1-bit Charikar/SimHash with corpus-mean centering. Centering is the single biggest lever: +0.324 R@100 at k=64 on SPECTER2.
 - `StackedSignBitQuantizer` — k-stack precision ladder (k=2,4,8 tested). Every step shrinks variance by 1/k while remaining rank-correct. No broken middle.
-- `Corpus` — packed binary codes + SQLite metadata sidecar. Maps array indices to record IDs with JSON metadata per record. [Postgres recipe](docs/postgres-recipe.md) included.
+- `Corpus` — packed binary codes + SQLite metadata sidecar. Maps array indices to record IDs with JSON metadata per record. See **Recipes** below for serving the same index from Postgres, S3 Vectors, or Athena.
 - `characterize()` — sweep a strategy × k grid on your encoder and get a recommended operating point.
 - Rotation choice — `rotation="haar"` (default, Haar-distributed QR) or `rotation="rht"` (randomized Hadamard, 1.5–1.8× faster to build). Measured equivalent for retrieval; see [`ROTATION_LSH.md`](bench/results/ROTATION_LSH.md) for why a structured rotation needed re-measuring here rather than inheriting remex's result, and for the single-round construction it rules out.
 - Native Hamming scan — C extension compiled at first import with hardware POPCNT. **25–35× over the NumPy LUT fallback**, 5–11 GB/s effective throughput. The ratio depends on `n` and `d` — 33× at n=1M/d=768, 28× at n=1M/d=256 — because the NumPy path materialises a uint16 gather ~3× the size of the index while the native path streams it once. Throughput drops from ~10 GB/s to ~7 GB/s between n=100k and n=1M, where the index outgrows last-level cache. Measured on an Intel Xeon @ 2.80 GHz; reproduce with `python3 bench/native_speedup.py`.
@@ -41,6 +41,7 @@ Future work is tracked in [issues](https://github.com/oaustegard/remax/issues). 
 **Recipes** (`docs/`):
 - [Text-to-candidates pipeline](docs/specter2-search-pipeline.md) — end-to-end SPECTER2 search on the binary path: encode, build, search, rerank.
 - [S3 Vectors recipe](docs/s3-vectors-recipe.md) — the managed-ANN path. S3 Vectors is float32-only, so remax's role narrows to the transform and the ID mapping; 256-d truncated + cosine returns R@100 = 0.998.
+- [Athena + Parquet recipe](docs/athena-recipe.md) — the binary-scan path: the same exhaustive Hamming scan as SQL over Parquet on S3. Codes go in as `ceil(d / 64)` `BIGINT` limbs, because Trino has no varbinary popcount to point at a `BINARY(32)` column. Athena reads the whole index every query (~3.7 GB, about $0.018 at 100 M × 256-d), so the recipe is explicit about when that trade is worth it.
 - [Postgres recipe](docs/postgres-recipe.md) — serve `Corpus` metadata from Postgres instead of the SQLite sidecar.
 
 **Test suite**: full coverage across core, stacked, corpus, native, characterize, and all benchmark modules. Security hardening pass completed.

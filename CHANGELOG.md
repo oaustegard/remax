@@ -28,6 +28,37 @@
     index does not threshold. `Corpus.build(center=True)` remains correct and
     load-bearing for the binary path.
 
+- **Athena + Parquet recipe** (`docs/athena-recipe.md`). The binary-scan path:
+  the same exhaustive Hamming scan, run as SQL over Parquet on S3 for a corpus
+  that already lives there. Documentation only — no library code changed, and
+  `pyarrow` is invoked from the recipe's snippets rather than the library.
+
+  Its schema is not the obvious one. Trino's `bit_count` and `bitwise_xor` take
+  `bigint` and nothing else — there is no varbinary popcount, and Athena engine
+  v3 is Trino-based — so a `BINARY(32)` code column has no query to run against
+  it. Codes are stored as `ceil(d / 64)` big-endian `BIGINT` limbs instead and
+  scored as a sum of per-limb popcounts.
+
+  This and the S3 Vectors recipe above are the two ways to serve a corpus out
+  of S3, and they are not variants of each other: S3 Vectors is float32-only,
+  so the binary codes have no place in it, whereas Athena scans exactly the
+  bytes `Corpus` writes. Athena reads the whole index every query and bills for
+  it (~3.7 GB, about $0.018 at 100 M × 256-d), so the recipe leads with the
+  case where that is the right trade and where it is not.
+
+- **`tests/test_athena_recipe.py`.** Extracts `to_limbs` and `hamming_sql` from
+  the recipe, evaluates the SQL they generate under Trino's
+  `bit_count`/`bitwise_xor` semantics, and asserts the ranking is identical to
+  `Corpus.search`. The recipe asks a reader to reimplement the scan in a second
+  place, and a drifting byte-to-limb transform does not raise — it returns a
+  well-formed ranking of the wrong neighbours. Shown to bite by mutating the
+  document: reversing the limb order in the generated SQL fails the ranking
+  test, byte-swapping the transform fails the round-trip test.
+
+  Not covered, because it is not coverable from here: that Athena accepts the
+  SQL. The signatures come from the Trino function reference; nothing has run
+  against a live endpoint, and the recipe's closing section says so.
+
 - **`bench/scale100m.py` and `bench/results/SCALE_100M.md`** — the n=1e6..1e8
   single-query measurement. `bench/results/QUERY_PATH_SPEED.md` establishes
   nothing above n=1e7 and says so; this is the range it declined to
