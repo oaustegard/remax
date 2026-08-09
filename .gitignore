@@ -45,6 +45,11 @@ bench/results/*
 !bench/results/BM25_FOLLOWUP.md
 !bench/results/ROTATION_LSH.md
 
+# Transform selection for a cosine-metric managed ANN index —
+# bench/s3_vectors_transform.py, consumed by docs/s3-vectors-recipe.md
+!bench/results/S3_VECTORS_TRANSFORM.md
+!bench/results/s3_vectors_transform.csv
+
 # jina-v5 on BEIR
 !bench/results/JINA_V5_BEIR.md
 !bench/results/jina_v5_beir.csv

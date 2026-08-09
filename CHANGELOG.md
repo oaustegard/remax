@@ -2,7 +2,31 @@
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- **S3 Vectors recipe** (`docs/s3-vectors-recipe.md`). The managed-ANN path:
+  S3 Vectors stores `float32` only and scores `cosine`/`euclidean`, so remax's
+  binary codes have no place in it and remax's contribution narrows to the
+  dimensional transform, the record-ID mapping, and the stage-2 source.
+  Documentation only — no library code changed, and nothing imports `boto3`.
+
+- **`bench/s3_vectors_transform.py`** plus
+  `bench/results/S3_VECTORS_TRANSFORM.md`. Measures which transform belongs in
+  such an index, because the existing figure could not be carried over:
+  `bench/results/SKETCH_MATRYOSHKA.md`'s center+truncate R@100 = 0.943 at 256-d was measured
+  with an **inner-product** scan, and no managed service offers raw IP. Two
+  results, 8 seeds each, on a driver that reproduces that file's rows exactly
+  at its own seed:
+
+  - Scoring cosine instead of IP over the same 256-d bytes moves truncate-only
+    from R@100 = 0.887 to **0.998**. SPECTER2 norms are clustered tightly
+    enough (cv 0.0067) that discarding them costs almost nothing.
+  - **Centering is a net loss on this path** — truncate-only wins by +0.042
+    R@10 at 256-d on 8 of 8 seeds, widening to +0.094 against cosine ground
+    truth. This is the boundary of the centering result, not a contradiction
+    of it: centering fixes thresholding at the origin, and a float32 cosine
+    index does not threshold. `Corpus.build(center=True)` remains correct and
+    load-bearing for the binary path.
 
 ## v0.2.0 — 2026-08-04
 
