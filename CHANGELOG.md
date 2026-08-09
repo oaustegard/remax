@@ -2,7 +2,24 @@
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- **`docs/athena-recipe.md`** — running the Hamming scan as SQL over Parquet
+  on S3, for a corpus that already lives there. No library change and no new
+  dependency: `pyarrow` is invoked only from the recipe's own snippets.
+
+  The schema is not the obvious one. Trino's `bit_count` and `bitwise_xor`
+  take `bigint` and nothing else — there is no varbinary popcount — so a
+  `BINARY(32)` code column has no query to run against it. Codes are stored
+  as `d / 64` big-endian `BIGINT` limbs instead and scored with a sum of
+  per-limb popcounts.
+
+  `tests/test_athena_recipe.py` extracts the recipe's `to_limbs` and
+  `hamming_sql`, evaluates the SQL they generate under Trino's semantics, and
+  asserts the ranking matches `Corpus.search`. A drifting transform would
+  otherwise return a well-formed ranking of the wrong neighbours rather than
+  an error. The SQL has not been run against a live Athena endpoint; the
+  recipe says so in its closing section.
 
 ## v0.2.0 — 2026-08-04
 
