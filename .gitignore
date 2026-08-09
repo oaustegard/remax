@@ -90,6 +90,11 @@ bench/results/*
 !bench/results/QUERY_PATH_SPEED.md
 !bench/results/query_path_speed.json
 
+# Issue #70 — what one query costs at n=1e8, which QUERY_PATH_SPEED.md
+# explicitly declined to extrapolate to.
+!bench/results/SCALE_100M.md
+!bench/results/scale100m.json
+
 # ── IDE ──────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/

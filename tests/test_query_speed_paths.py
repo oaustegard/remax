@@ -386,10 +386,141 @@ def test_block_must_be_positive(data):
                            5, block=0)
 
 
-def test_auto_block_does_not_block_a_single_query(data):
-    """One query reads the corpus once regardless; blocking only adds work."""
-    assert packing._resolve_block(None, 10**7, 1, 32) == 10**7
+def test_auto_block_leaves_a_small_single_query_unblocked(data):
+    """Below the floor the whole score array is cache-resident already, so
+    blocking a single query only adds per-block Python (issue #70)."""
+    n = packing._MIN_SINGLE_QUERY_N - 1
+    assert packing._resolve_block(None, n, 1, 32) == n
+
+
+def test_auto_block_blocks_a_large_single_query(data):
+    """Above the floor it does block — not for corpus locality (one query
+    streams the corpus once either way) but so the running threshold can
+    filter the scores in cache. Issue #70; measured in SCALE_100M.md."""
+    blk = packing._resolve_block(None, 10**7, 1, 32)
+    assert blk < 10**7
+    # Sized on the score buffer, not on the codes: 4 MiB of int32.
+    assert blk == packing._SINGLE_QUERY_SCORE_BYTES // 4
     assert packing._resolve_block(None, 10**7, 8, 32) < 10**7
+
+
+def test_auto_block_gives_a_single_query_several_blocks(data):
+    """Just past the floor the score target alone would leave a single block,
+    and a corpus that never establishes a threshold never filters."""
+    n = 4 * packing._MIN_SINGLE_QUERY_N
+    blk = packing._resolve_block(None, n, 1, 32)
+    assert blk < n
+    assert -(-n // blk) >= packing._MIN_SINGLE_QUERY_BLOCKS
+
+
+def test_blocked_single_query_is_identical_to_the_unblocked_one():
+    """The single-query path is blocked past _MIN_SINGLE_QUERY_N (issue #70).
+    Same corpus, both sides of the dispatch, byte-identical."""
+    rng = np.random.default_rng(31)
+    n = packing._MIN_SINGLE_QUERY_N * 3
+    codes = rng.integers(0, 256, size=(n, 16), dtype=np.uint8)
+    q_codes = rng.integers(0, 256, size=(1, 16), dtype=np.uint8)
+    auto_idx, auto_dist = hamming_topk_batch(codes, q_codes, 25)
+    assert packing._resolve_block(None, n, 1, 16) < n  # the path under test
+    ref_idx, ref_dist = hamming_topk_batch(codes, q_codes, 25, block=n)
+    np.testing.assert_array_equal(auto_idx, ref_idx)
+    np.testing.assert_array_equal(auto_dist, ref_dist)
+    d = hamming_distances(codes, q_codes[0])
+    np.testing.assert_array_equal(auto_idx[0], _argsort_ref(d, 25))
+
+
+# ── the running threshold ─────────────────────────────────────────────────
+#
+# The per-block filter added for issue #70. Its whole claim is that a row
+# further away than the k-th candidate already held cannot enter the answer,
+# so these check the claim where it is easiest to violate: ties at exactly the
+# threshold, and blocks that overflow the k-list and must trim themselves.
+
+def test_running_threshold_is_the_kth_not_the_best():
+    """A bound taken from the front of the list filters out ranks 2..k."""
+    run_dist = np.array([3, 5, 5, 9], dtype=np.int32)
+    assert packing._running_threshold(run_dist, 4, 256) == 9
+    # Fewer than k held: no bound exists yet, so nothing may be filtered.
+    assert packing._running_threshold(run_dist[:2], 4, 256) == 256
+
+
+def test_block_candidates_drops_rows_that_tie_the_threshold():
+    """They tie the k-th held distance with a larger index, so they lose the
+    (distance, index) order anyway — see _block_candidates' docstring."""
+    d = np.array([4, 7, 7, 2, 9], dtype=np.int32)
+    got = packing._block_candidates(d, 1000, 3, 7)
+    np.testing.assert_array_equal(got[0], [1000, 1003])
+    np.testing.assert_array_equal(got[1], [4, 2])
+    assert packing._block_candidates(d, 0, 3, 2) is None
+
+
+def test_block_candidates_trims_ties_toward_the_lower_index():
+    """More than k survivors: the trim must be stable, or remax#32 comes back
+    one level down. Rows 0 and 3 tie at 1; the k=2 cut must keep 0."""
+    d = np.array([1, 0, 5, 1], dtype=np.int32)
+    idx, dist = packing._block_candidates(d, 0, 2, 4)
+    np.testing.assert_array_equal(idx, [1, 0])
+    np.testing.assert_array_equal(dist, [0, 1])
+
+
+def test_blocked_batch_on_a_tie_dense_corpus_at_every_block_size():
+    """Duplicate rows make every block overflow the k-list, so the per-block
+    trim runs on every block instead of almost never."""
+    rng = np.random.default_rng(19)
+    base = rng.integers(0, 256, size=(12, 16), dtype=np.uint8)
+    codes = np.ascontiguousarray(np.tile(base, (200, 1)))  # 2400 rows
+    q_codes = rng.integers(0, 256, size=(3, 16), dtype=np.uint8)
+    for block in (5, 31, 256, 2400):
+        idx, _ = hamming_topk_batch(codes, q_codes, 40, block=block)
+        for i in range(3):
+            d = hamming_distances(codes, q_codes[i])
+            np.testing.assert_array_equal(idx[i], _argsort_ref(d, 40))
+
+
+def test_blocked_batch_when_blocks_overflow_into_a_tie_group():
+    """The per-block trim's tie order, on a corpus built to make it run.
+
+    A far prefix leaves the running threshold loose, so later blocks put far
+    more than k rows under it and the trim executes; five distinct near rows
+    repeated 800 times put the trim's k-th position inside a tie group, which
+    is what makes its *order* observable rather than only its membership.
+    Without the second property an unstable trim passes by luck.
+    """
+    rng = np.random.default_rng(5)
+    far = rng.integers(0, 256, size=(2000, 32), dtype=np.uint8)
+    near_base = np.zeros((5, 32), dtype=np.uint8)
+    for j in range(5):
+        near_base[j, : j + 1] = 1 << j
+    codes = np.ascontiguousarray(
+        np.concatenate([far, np.tile(near_base, (800, 1))])
+    )
+    q_codes = np.zeros((1, 32), dtype=np.uint8)
+    d = hamming_distances(codes, q_codes[0])
+    for k in (10, 40):
+        for block in (61, 512, 1024, codes.shape[0]):
+            idx, _ = hamming_topk_batch(codes, q_codes, k, block=block)
+            np.testing.assert_array_equal(idx[0], _argsort_ref(d, k))
+
+
+def test_blocked_batch_when_every_row_is_the_query():
+    """Distance 0 everywhere: the threshold is 0 from the first block on, and
+    a filter written `<=` would select the whole corpus every block."""
+    row = np.array([[0xA5] * 16], dtype=np.uint8)
+    codes = np.ascontiguousarray(np.tile(row, (1500, 1)))
+    idx, dist = hamming_topk_batch(codes, row, 10, block=64)
+    np.testing.assert_array_equal(idx[0], np.arange(10))
+    np.testing.assert_array_equal(dist[0], np.zeros(10, dtype=np.int32))
+
+
+def test_blocked_batch_when_every_row_is_maximally_distant():
+    """The k-th distance is 8*B, which is also the "no bound yet" sentinel.
+    The block must still be ranked outright, and correctly."""
+    row = np.array([[0x00] * 16], dtype=np.uint8)
+    codes = np.ascontiguousarray(np.tile(row, (600, 1)))
+    q_codes = np.array([[0xFF] * 16], dtype=np.uint8)
+    idx, dist = hamming_topk_batch(codes, q_codes, 10, block=64)
+    np.testing.assert_array_equal(idx[0], np.arange(10))
+    np.testing.assert_array_equal(dist[0], np.full(10, 8 * 16, dtype=np.int32))
 
 
 # ── 4. mmap residency ─────────────────────────────────────────────────────

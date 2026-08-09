@@ -754,6 +754,27 @@ def stable_top_k(
 #   * truncating to k after each block is safe because an element outside the
 #     top-k of everything seen so far can never re-enter — later blocks only
 #     add competitors.
+#
+# THE RUNNING THRESHOLD (added for issue #70). Each block used to contribute a
+# full stable top-k of itself — an argpartition or histogram over every one of
+# its rows, to pick the k that might matter. That is the wrong question after
+# the first block. Once k candidates are held, their k-th distance is a bound:
+# a row further away than it already has k rows at least as close and earlier
+# in index order, so it cannot enter the answer no matter what follows. Testing
+# `d < threshold` answers "might this row matter" in one comparison pass and
+# emits only the survivors — typically a handful per block instead of k.
+#
+# This is exact, not approximate, and for the same reason the truncation above
+# is: the threshold only ever names rows that are already beaten k times over.
+# It is also self-correcting — the threshold falls as better candidates arrive,
+# so later blocks filter harder. Nothing is sampled and nothing is estimated,
+# which is what separates it from the two-phase "pick a cutoff, hope it fills"
+# shape the issue proposed; there is no under-fill case to fall back from.
+#
+# Measured at n=1e8, B=32, k=100, single query, one thread: 938 ms for the
+# unblocked scan-then-select against 567 ms here. The gap is nearly all
+# selection — the scan floor is 518 ms, so selection went from 0.81x the scan
+# to 0.095x of it. bench/results/SCALE_100M.md.
 
 #: Target footprint for one corpus block, in bytes. 4 MB is this box's L2 per
 #: core; the block is read from DRAM once and then hit m-1 times out of cache.
@@ -763,6 +784,33 @@ _BLOCK_TARGET_BYTES = 4 << 20
 #: merge overhead dominates whatever locality is bought.
 _MIN_BLOCK_ROWS = 1 << 13
 
+#: Target footprint for one block of **scores**, in bytes, on the single-query
+#: path. A different quantity from ``_BLOCK_TARGET_BYTES`` and deliberately so:
+#: with one query the corpus is streamed once whatever the block size, so
+#: sizing the block on codes optimises traffic that is already minimal. What is
+#: left to keep in cache is the ``(blk,) int32`` the scan writes and the filter
+#: immediately reads back. 4 MiB of int32 is 2^20 rows, which is this box's L2.
+#: Measured at n=1e8 the curve is a plateau across 0.5-8 MiB of scores (607.7 /
+#: 581.2 / 569.3 / 606.3 ms) with both edges clearly worse (665.9 ms at
+#: 0.125 MiB, 601.6 ms at 32 MiB). 2 and 4 MiB are not distinguishable across
+#: runs, so this is the L2 argument resting on a measured plateau, NOT a
+#: measured optimum — bench/results/SCALE_100M.md says so in those words.
+_SINGLE_QUERY_SCORE_BYTES = 4 << 20
+
+#: Fewest blocks worth splitting a single query into. Below the score target,
+#: the block is sized to give at least this many, so a corpus that is merely
+#: *above* the no-block floor still gets a threshold established early instead
+#: of spending its whole first (and only other) block unfiltered. Two blocks
+#: measured 0.94x — a real slowdown, since only the second block filters and
+#: there is not enough corpus left to repay the bookkeeping.
+_MIN_SINGLE_QUERY_BLOCKS = 4
+
+#: Below this many rows a single query is not blocked at all. The whole score
+#: array is ~256 KB here and already cache-resident, so there is no DRAM
+#: round-trip to remove and only per-block Python to add. Measured: the win
+#: appears at n=1e5 (1.33-1.45x) and is absent below it.
+_MIN_SINGLE_QUERY_N = 1 << 16
+
 
 def _resolve_block(block: int | None, n: int, m: int, code_bytes: int) -> int:
     """Rows per corpus block. ``n`` (i.e. no blocking) when it cannot pay."""
@@ -771,11 +819,80 @@ def _resolve_block(block: int | None, n: int, m: int, code_bytes: int) -> int:
             raise ValueError(f"block must be positive, got {block}")
         return min(int(block), n)
     if m < 2:
-        return n  # one query reads the corpus once regardless
+        # One query reads the corpus once regardless, so this block is not
+        # sized on codes at all — see _SINGLE_QUERY_SCORE_BYTES. What blocking
+        # buys here is the running threshold: the scores stay in cache and are
+        # filtered against a bound instead of being written to DRAM, read back,
+        # and selected over in full.
+        if n < _MIN_SINGLE_QUERY_N:
+            return n
+        rows = min(
+            _SINGLE_QUERY_SCORE_BYTES // 4,
+            max(_MIN_BLOCK_ROWS, n // _MIN_SINGLE_QUERY_BLOCKS),
+        )
+        return int(rows) if rows < n else n
     rows = max(_MIN_BLOCK_ROWS, _BLOCK_TARGET_BYTES // max(1, code_bytes))
     if rows >= n:
         return n  # already fits; blocking would only add bookkeeping
     return int(rows)
+
+
+def _running_threshold(run_dist: np.ndarray, k: int, bound: int) -> int:
+    """Distance bound implied by the candidates held so far.
+
+    The **k-th** smallest, not the smallest: a row is out of contention once
+    ``k`` rows are already at least as close, and ``run_dist`` is ascending, so
+    that is its last element. ``bound`` (the largest a distance can be, ``8B``)
+    while fewer than ``k`` are held, which filters nothing — there is no bound
+    to apply until the list is full.
+    """
+    return int(run_dist[-1]) if run_dist.size >= k else bound
+
+
+def _block_candidates(
+    d: np.ndarray, start: int, k: int, thresh: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Rows of one scored block that can still enter a k-list bounded by
+    ``thresh``. ``None`` when no row can.
+
+    One comparison pass, and only survivors are materialised — against the
+    ``stable_top_k`` this replaces, which had to rank every row of the block to
+    find the k that might matter. Past the first block or two "might matter" is
+    a handful of rows, and the threshold falls as better candidates arrive, so
+    later blocks filter harder.
+
+    ``<`` and not ``<=``, which is the opposite of what the tie-stability rule
+    everywhere else in this file would suggest, so it is worth the proof. The
+    caller only reaches here with ``thresh < bound``, which means it holds
+    exactly ``k`` candidates, all with indices below ``start`` and distances at
+    most ``thresh``. A row of this block at distance exactly ``thresh``
+    therefore ties the k-th held candidate while having a **larger index**, so
+    in ``(distance, index)`` order it sits at position k+1 or worse — and later
+    blocks only add competitors, so it can never climb. Admitting the tie group
+    would be equally correct and pure cost, and on a tie-dense corpus that cost
+    is unbounded: at the degenerate limit (every row identical) ``<=`` selects
+    every row of every block, which is the ``O(n)`` materialisation this path
+    exists to avoid.
+
+    Neither comparison can change the answer, so neither is gated as a defect;
+    ``bench/gates/query_path_gate.py`` states that in its coverage limits
+    rather than pretending to check it.
+    """
+    sel = np.flatnonzero(d < thresh)
+    if sel.size == 0:
+        return None
+    new_idx = sel.astype(np.intp, copy=False) + start
+    new_dist = d[sel]
+    if new_dist.size > k:
+        # Bound the merge. `sel` is ascending, so a stable sort on distance
+        # orders by (distance, index) and the first k are this block's best; a
+        # dropped row is beaten by k rows of this same block, all of which the
+        # merge sees, so it could not have survived either. The sort must be
+        # stable for that to hold — an argpartition here reintroduces remax#32
+        # one level down, and the gate simulates exactly that.
+        keep = np.argsort(new_dist, kind="stable")[:k]
+        new_idx, new_dist = new_idx[keep], new_dist[keep]
+    return new_idx, new_dist
 
 
 def _merge_topk(
@@ -828,9 +945,13 @@ def hamming_topk_batch(
         one (block, query) scan, so a batch keeps every worker fed even when a
         single block is too small to split.
     block : int | None, keyword-only
-        Rows per corpus block. ``None`` picks a cache-sized block for ``m >= 2``
-        and disables blocking for a single query (where it buys nothing).
-        Passing ``block=n`` restores the per-query full-corpus loop exactly.
+        Rows per corpus block. ``None`` picks a cache-sized block, sized on
+        **codes** for ``m >= 2`` (each block is reused by every query) and on
+        **scores** for a single query (the corpus streams once either way; what
+        blocking buys there is the running threshold). Blocking is off below
+        ``_MIN_SINGLE_QUERY_N`` rows for a single query, where the whole score
+        array is cache-resident already. Passing ``block=n`` restores the
+        per-query full-corpus loop exactly.
 
     Returns
     -------
@@ -875,7 +996,23 @@ def hamming_topk_batch(
     buf = np.empty((m, blk), dtype=np.int32)
     run_idx = [np.empty(0, dtype=np.intp) for _ in range(m)]
     run_dist = [np.empty(0, dtype=np.int32) for _ in range(m)]
+    # Per-query running threshold: the k-th smallest distance seen so far, or
+    # `bound` (the largest a distance can be) while fewer than k are held. See
+    # the module comment above for why discarding `d > thresh` cannot change
+    # the answer. `thresh == bound` is the "rank the block outright" signal
+    # below; a query whose k-th neighbour really is `bound` away — every bit
+    # different — keeps taking that branch, which is slower and equally exact,
+    # because filtering on `d <= bound` would select the whole block anyway.
+    thresh = [bound] * m
     pool = _pool(workers) if workers > 1 and m > 1 else None
+    # Where the parallelism goes. With several queries the unit of work is one
+    # (block, query) scan, which keeps every worker fed even when a block is
+    # too small to split — so the inner scans run single-threaded. With ONE
+    # query there is no such unit, and pinning the inner scan to a single
+    # thread would silently serialise a caller that asked for four: a blocked
+    # single query would then be slower than the unblocked path it replaced,
+    # which is exactly what `threads=` was passed to avoid.
+    inner_threads = workers if pool is None else 1
 
     for start in range(0, n, blk):
         stop = min(start + blk, n)
@@ -884,7 +1021,8 @@ def hamming_topk_batch(
         if pool is None:
             for i in range(m):
                 hamming_distances(
-                    sub, q_codes[i], out=buf[i, :length], threads=1
+                    sub, q_codes[i], out=buf[i, :length],
+                    threads=inner_threads,
                 )
         else:
             futures = [
@@ -902,12 +1040,18 @@ def hamming_topk_batch(
         kk = min(k_eff, length)
         for i in range(m):
             d = buf[i, :length]
-            order = stable_top_k(d, kk, value_bound=bound)
+            if thresh[i] >= bound:
+                # No usable bound yet — rank the block outright.
+                order = stable_top_k(d, kk, value_bound=bound)
+                cand = (order.astype(np.intp, copy=False) + start, d[order])
+            else:
+                cand = _block_candidates(d, start, k_eff, thresh[i])
+                if cand is None:
+                    continue
             run_idx[i], run_dist[i] = _merge_topk(
-                run_idx[i], run_dist[i],
-                order.astype(np.intp, copy=False) + start, d[order],
-                k_eff,
+                run_idx[i], run_dist[i], cand[0], cand[1], k_eff,
             )
+            thresh[i] = _running_threshold(run_dist[i], k_eff, bound)
 
     for i in range(m):
         out_idx[i] = run_idx[i]
