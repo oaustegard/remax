@@ -552,6 +552,56 @@ def _sim_blocked_merge_order_swapped() -> None:
     packing_mod._merge_topk = patched
 
 
+def _sim_block_candidates_truncate_unstably() -> None:
+    """The per-block candidate list cut to k with ``argpartition``.
+
+    When more than k rows of a block pass the threshold the filter trims them
+    before merging, and the trim has to be stable: the survivors are in
+    ascending index order, so only a stable sort on distance leaves them in
+    ``(distance, index)`` order. ``np.argpartition`` returns the same k
+    *distances* and picks arbitrarily among rows that tie at the k-th — so a
+    tie between row 12 and row 3000 inside one block can resolve to 3000, and
+    the merge, which trusts its input to be ordered, has no way to notice.
+
+    This is remax PR #32 one level down: the same defect the select was fixed
+    for, reintroduced in the filter that now feeds it.
+    """
+    def patched(d, start, k, thresh):
+        sel = np.flatnonzero(d < thresh)
+        if sel.size == 0:
+            return None
+        new_idx = sel.astype(np.intp, copy=False) + start
+        new_dist = d[sel]
+        if new_dist.size > k:
+            keep = np.argpartition(new_dist, k - 1)[:k]
+            keep = keep[np.argsort(new_dist[keep], kind="stable")]
+            new_idx, new_dist = new_idx[keep], new_dist[keep]
+        return new_idx, new_dist
+
+    packing_mod._block_candidates = patched
+
+
+def _sim_block_threshold_uses_best_not_kth() -> None:
+    """The running threshold read off the FRONT of the candidate list.
+
+    ``run_dist[0]`` instead of ``run_dist[-1]`` — the nearest neighbour found
+    so far rather than the k-th. Both are ordinary-looking indices into an
+    ascending array, and the wrong one is a strictly *tighter* bound, so the
+    filter still runs, still returns k neighbours, and still returns them in
+    ascending distance order. What it returns is the top-k of a corpus it
+    stopped examining properly after the first block: anything that would rank
+    2..k is filtered out of every later block unless it beats the running best.
+
+    A speed-motivated bound is exactly the kind of change that fails this way.
+    Too loose is merely slow and visible in a benchmark; too tight is invisible
+    in the shape of the answer and fatal to its contents.
+    """
+    def patched(run_dist, k, bound):
+        return int(run_dist[0]) if run_dist.size >= k else bound
+
+    packing_mod._running_threshold = patched
+
+
 def _sim_mmap_silently_copies() -> None:
     """``residency="mmap"`` that reads the file instead of mapping it.
 
@@ -603,6 +653,8 @@ SIMULATIONS = {
     "blocked-merge-forgets-earlier-blocks":
         _sim_blocked_merge_forgets_earlier_blocks,
     "blocked-merge-order-swapped": _sim_blocked_merge_order_swapped,
+    "block-candidates-truncate-unstably": _sim_block_candidates_truncate_unstably,
+    "block-threshold-uses-best-not-kth": _sim_block_threshold_uses_best_not_kth,
     "mmap-silently-copies": _sim_mmap_silently_copies,
     "mmap-loses-contiguity": _sim_mmap_loses_contiguity,
 }
@@ -934,6 +986,70 @@ def run_gate() -> int:
         f"block={BLOCK_SIZES[0]} is smaller than k, so no single block can "
         f"supply the answer",
     )
+    # A corpus built so the per-block threshold filter OVERFLOWS and has to trim
+    # itself, which the Gaussian corpus above almost never makes it do: there
+    # the threshold falls within two blocks and every later block yields a
+    # handful of candidates. Two properties, both deliberate:
+    #
+    #   * a far prefix followed by a near tail, so the threshold established by
+    #     the first blocks is loose and later blocks put hundreds of rows under
+    #     it — that is what makes the trim run at all;
+    #   * only five distinct rows in that tail, each repeated 800 times, so the
+    #     trim's k-th position is inside a tie group — that is what makes its
+    #     tie ORDER observable rather than merely its membership.
+    #
+    # Without the second property an unstable trim returns the right answer by
+    # luck. Without the first the trim never executes and the check is vacuous;
+    # `trims`/`boundary_ties` in the detail line are how that stays visible.
+    dup_rng = np.random.default_rng(SEED + 17)
+    dup_far = dup_rng.integers(0, 256, size=(2000, D // 8), dtype=np.uint8)
+    dup_near_base = np.zeros((5, D // 8), dtype=np.uint8)
+    for j in range(5):
+        dup_near_base[j, : j + 1] = 1 << j        # 1..5 bits from the query
+    dup_codes = np.ascontiguousarray(
+        np.concatenate([dup_far, np.tile(dup_near_base, (800, 1))])
+    )
+    dup_q = np.zeros((1, D // 8), dtype=np.uint8)
+    dup_d = np.asarray(hamming_distances(dup_codes, dup_q[0]))
+    dup_ok, dup_detail = True, []
+    dup_stats = {"trims": 0, "boundary_ties": 0}
+
+    real_candidates = packing_mod._block_candidates
+
+    def _counting_candidates(d, start, k, thresh):
+        sel = np.flatnonzero(d < thresh)
+        if sel.size > k:
+            dup_stats["trims"] += 1
+            vals = np.sort(d[sel])
+            if vals[k - 1] == vals[k]:
+                dup_stats["boundary_ties"] += 1
+        return real_candidates(d, start, k, thresh)
+
+    packing_mod._block_candidates = _counting_candidates
+    try:
+        for dup_k in (10, 40):
+            dup_truth = np.argsort(dup_d, kind="stable")[:dup_k]
+            for blk in (61, 512, 1024, dup_codes.shape[0]):
+                idx_d, _ = packing_mod.hamming_topk_batch(
+                    dup_codes, dup_q, dup_k, block=blk
+                )
+                if not np.array_equal(idx_d[0], dup_truth):
+                    dup_ok = False
+                    dup_detail.append(f"k={dup_k} blk={blk}")
+    finally:
+        packing_mod._block_candidates = real_candidates
+    g.check(
+        dup_ok and dup_stats["boundary_ties"] > 0,
+        "the blocked scan equals argsort(kind='stable')[:k] on a corpus whose "
+        "blocks overflow the k-list into a tie group "
+        "[anchor: numpy's documented stable sort]",
+        f"n={dup_codes.shape[0]} (2,000 far rows then 5 distinct near rows "
+        f"x800) k in (10, 40), blocks 61..{dup_codes.shape[0]}; the per-block "
+        f"trim ran {dup_stats['trims']} times, {dup_stats['boundary_ties']} of "
+        f"them with a tie at the k-th position — a zero there would make this "
+        f"check vacuous. mismatches: {dup_detail or 'none'}",
+    )
+
     unblocked_idx, unblocked_dist = packing_mod.hamming_topk_batch(
         codes, q_codes_all, K, block=N
     )
@@ -1102,6 +1218,23 @@ def run_gate() -> int:
         "performance claim and is neither made nor checked here — at this n "
         "the whole corpus fits in L2 and blocking cannot help. What is checked "
         "is only that blocking does not change the answer."
+    )
+    g.coverage(
+        "The per-block threshold's comparison sense is not gated, because "
+        "neither sense is wrong. `_block_candidates` filters on `d < thresh`; "
+        "`d <= thresh` returns the identical answer, since a row tying the "
+        "k-th held distance has a larger index and loses the (distance, index) "
+        "order anyway. The strict form is chosen on cost — `<=` selects every "
+        "row of every block on a corpus of identical rows — and cost is not "
+        "what this file checks. A simulated `<=` was written and removed for "
+        "being green on merit rather than by oversight."
+    )
+    g.coverage(
+        "Blocking a SINGLE query is new (issue #70) and is exercised here only "
+        "through explicit `block=` values. The automatic dispatch that turns it "
+        "on — _resolve_block's `m < 2` branch and its _MIN_SINGLE_QUERY_N "
+        "floor — is unit-tested, not gated: at n=4000 the floor keeps it off, "
+        "and raising n far enough to trip it would make this gate a benchmark."
     )
     g.coverage(
         "Speed is not gated, for any of these. Threading, counting select, "

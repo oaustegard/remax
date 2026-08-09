@@ -80,7 +80,7 @@ jobs:
       - name: query path gate (must pass)
         run: python bench/gates/query_path_gate.py
 
-      - name: query path gate (must go RED on each of its 8 simulated defects)
+      - name: query path gate (must go RED on each of its simulated defects)
         # --self-test re-invokes the gate once per defect and fails unless
         # every one produces exit 1. This is the check on the gate itself.
         run: python bench/gates/query_path_gate.py --self-test

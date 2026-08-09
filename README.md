@@ -113,6 +113,14 @@ remax.packing.set_default_threads(1)   # "auto" for all cores; REMAX_THREADS too
 # instead of once per query. Automatic for m >= 2.
 batch_top_k = q.search(embeddings[:8], codes, k=10)
 
+# A single query blocks too, for a different reason. Once k candidates are
+# held, their k-th distance bounds everything that could still matter, so each
+# block is filtered against it while still in cache instead of every distance
+# being written out and ranked in full. Selection, not the scan, is what costs
+# at scale: at n=1e8 it was 0.96x the scan and is now 0.18x. Automatic above a
+# measured n; see bench/results/SCALE_100M.md.
+one_query = q.search(query, codes, k=10)
+
 # mmap an index instead of reading it into private heap: O(1) open, pages
 # faulted in on touch, shared between processes, evictable under memory
 # pressure. The default is still "load" — the historical behaviour.
@@ -128,9 +136,12 @@ better = corpus.search(query, k=10, asymmetric=True)
 ```
 
 Measurements, with the box and the scope limits stated, are in
-[`bench/results/QUERY_PATH_SPEED.md`](bench/results/QUERY_PATH_SPEED.md). That
-the answers do not change is not measured but *gated*:
-`bench/gates/query_path_gate.py`, which proves itself by going red under 14
+[`bench/results/QUERY_PATH_SPEED.md`](bench/results/QUERY_PATH_SPEED.md) up to
+n=1e7 and [`bench/results/SCALE_100M.md`](bench/results/SCALE_100M.md) from
+there to n=1e8 — two files because the first establishes nothing above 1e7 and
+says so, and a bandwidth-bound scan changes regime at every cache boundary.
+That the answers do not change is not measured but *gated*:
+`bench/gates/query_path_gate.py`, which proves itself by going red under 16
 simulated defects.
 
 ## Relationship to remex

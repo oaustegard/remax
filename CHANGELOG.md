@@ -2,7 +2,53 @@
 
 ## Unreleased
 
-Nothing yet.
+### Changed
+
+- **The single-query path is now blocked, and every block filters against a
+  running threshold** (issue #70). Bit-identical to what it replaces — same
+  exhaustive scan, same `n * B` popcount operations, same
+  `np.argsort(kind="stable")[:k]` contract — and measured **1.7x faster end to
+  end at n=1e8** on one thread (938 ms → 567 ms), 1.8x on four (441 ms →
+  251 ms). The m>1 batch path takes the same filter and gains 1.4-2.2x with it.
+
+  Two changes, one idea. `hamming_topk_batch` used to rank every block in full
+  with `stable_top_k` in order to find the k rows that might matter; it now
+  keeps the k-th distance of the candidates it already holds and tests each
+  block against it in a single comparison pass, emitting only survivors. That
+  bound is exact — a row further away already has k rows at least as close and
+  earlier in index order — so nothing is sampled, nothing is estimated, and
+  there is no under-fill case to fall back from. And `_resolve_block` no longer
+  declines to block a single query above `_MIN_SINGLE_QUERY_N` rows, because
+  what blocking buys there is not corpus locality (one query streams the corpus
+  once at any block size) but keeping the score buffer in cache instead of
+  writing 400 MB of distances out to DRAM and reading them back to select over.
+
+  Selection was the whole cost at scale, not the scan: at n=1e8 it was 0.81x
+  the scan and is now 0.095x. Numbers, arms and scope in
+  `bench/results/SCALE_100M.md`, reproduced by `bench/scale100m.py`.
+- **`hamming_topk_batch` honours `threads=` for a single query.** In the
+  blocked path the parallel unit is one (block, query) scan, which needs
+  `m > 1`; a single query fell through that and ran its inner scans pinned to
+  one thread. Reachable before this release only by passing `block=`
+  explicitly, and load-bearing now that a single query blocks by default —
+  without it a four-thread caller would have been silently serialised.
+
+### Added
+
+- **`bench/scale100m.py` and `bench/results/SCALE_100M.md`** — the n=1e6..1e8
+  single-query measurement. `bench/results/QUERY_PATH_SPEED.md` establishes nothing above
+  n=1e7 and says so; this is the range it declined to extrapolate into.
+- **Two more simulated defects in `bench/gates/query_path_gate.py`**
+  (16 total, was 14), both aimed at the new filter: a threshold read off the
+  front of the candidate list rather than from its k-th slot, and a per-block
+  trim that cuts with `argpartition` instead of a stable sort. Plus a blocked
+  check on a corpus built so blocks overflow the k-list into a tie group — a
+  far prefix that keeps the threshold loose, then five distinct near rows
+  repeated 800 times — which is what makes the trim run at all, and which
+  turned out to be needed to keep an *existing* known-bad
+  (`blocked-merge-forgets-earlier-blocks`) red, since the new filter had made
+  that defect's guard inert. The check asserts that the trim actually ran with
+  a boundary tie, so it cannot go quietly vacuous the way its first draft did.
 
 ## v0.2.0 — 2026-08-04
 

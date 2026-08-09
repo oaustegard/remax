@@ -208,11 +208,13 @@ class SignBitQuantizer:
             GIL, so this is real parallelism; results are bit-identical at any
             thread count because the decomposition is a row partition.
         block : int | None, keyword-only
-            Corpus rows held per pass. ``None`` blocks automatically for a
-            batch (``m >= 2``) so the corpus is read once per block for all
-            queries instead of once per query, and does not block a single
-            query. ``block=len(codes)`` forces the old per-query full pass.
-            Output is bit-identical either way.
+            Corpus rows held per pass. ``None`` blocks automatically, for two
+            different reasons: a batch (``m >= 2``) so the corpus is read once
+            per block for all queries instead of once per query, and a single
+            large query so its distances are filtered against a running
+            threshold while still in cache rather than written out in full and
+            selected over. ``block=len(codes)`` forces the old per-query full
+            pass. Output is bit-identical either way.
 
         Returns
         -------
